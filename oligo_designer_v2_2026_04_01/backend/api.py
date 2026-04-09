@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from Bio.Seq import Seq
+import re
 import sys
 import os
 from pathlib import Path
@@ -211,6 +212,7 @@ class CodonOptRequest(BaseModel):
     gc_window: int = Field(50, ge=20, le=200)
     uniquify_kmers: int = Field(10, ge=6, le=20, description="Max repeated k-mer length to eliminate")
     avoid_patterns: list[str] = Field(default_factory=list, description="Additional patterns to avoid (regex)")
+    min_codon_frequency: float = Field(10.0, ge=0.0, le=100.0, description="Minimum codon frequency (/1000) allowed")
 
 
 class CodonDetail(BaseModel):
@@ -246,6 +248,7 @@ class CodonOptResponse(BaseModel):
     codons: list[CodonDetail]
     codon_table: list[CodonTableEntry]
     codon_table_name: str
+    optimization_report: dict = {}
 
 
 @app.post("/api/codon-optimize", response_model=CodonOptResponse)
@@ -302,16 +305,10 @@ def codon_optimize(req: CodonOptRequest):
             raw_table[aa] = {c: round(v * 1000, 1) for c, v in usage_table[aa].items()}
 
     # Build constraints
-    constraints = [EnforceTranslation()]
-    for base in "GC":
-        constraints.append(AvoidPattern(base * req.avoid_homopolymers_gc))
-    for base in "AT":
-        constraints.append(AvoidPattern(base * req.avoid_homopolymers_at))
-    constraints.append(EnforceGCContent(
-        mini=req.gc_min, maxi=req.gc_max, window=req.gc_window
-    ))
-    for pat in req.avoid_patterns:
-        constraints.append(AvoidPattern(pat))
+    constraints = _build_constraints(
+        req.avoid_homopolymers_gc, req.avoid_homopolymers_at,
+        req.gc_min, req.gc_max, req.gc_window, req.avoid_patterns,
+    )
 
     # Optimize (k-mer uniqueness is checked as a warning, not enforced as a
     # constraint, so DNA Chisel always picks the best codons)
@@ -328,11 +325,12 @@ def codon_optimize(req: CodonOptRequest):
 
     # DP refinement: redistribute GC-fixing codon swaps to minimize score loss
     from gc_refinement import refine_gc_windows
-    opt_dna = refine_gc_windows(
+    opt_dna, freq_warnings, opt_report = refine_gc_windows(
         opt_dna, raw_table,
         gc_min=req.gc_min, gc_max=req.gc_max, gc_window=req.gc_window,
         homo_gc=req.avoid_homopolymers_gc, homo_at=req.avoid_homopolymers_at,
         avoid_patterns=req.avoid_patterns,
+        min_codon_frequency=req.min_codon_frequency,
     )
 
     back_protein = str(Seq(opt_dna).translate())
@@ -384,11 +382,23 @@ def codon_optimize(req: CodonOptRequest):
             "enforced": False,
         })
 
+    # Min codon frequency constraint
+    if req.min_codon_frequency > 0:
+        floor_pass = len(freq_warnings) == 0
+        summary.append({
+            "constraint": f"MinCodonFrequency(min:{req.min_codon_frequency}/1000)",
+            "passing": floor_pass,
+            "message": "" if floor_pass else f"{len(freq_warnings)} codon(s) below {req.min_codon_frequency}/1000",
+            "enforced": True,
+        })
+
     # Warnings: scan + k-mer failing locations (grouped by matching sequence)
     opt_warnings = _scan_warnings(
-        opt_dna, gc_min=req.gc_min, gc_max=req.gc_max, gc_window=req.gc_window
+        opt_dna, gc_min=req.gc_min, gc_max=req.gc_max, gc_window=req.gc_window,
+        homo_gc=req.avoid_homopolymers_gc, homo_at=req.avoid_homopolymers_at,
     )
     opt_warnings.extend(_kmer_warnings(opt_dna, kmer_problem, req.uniquify_kmers))
+    opt_warnings.extend(freq_warnings)
 
     all_pass = eval_problem.all_constraints_pass()
 
@@ -405,6 +415,7 @@ def codon_optimize(req: CodonOptRequest):
         codons=codons_detail,
         codon_table=table_entries,
         codon_table_name=table_name,
+        optimization_report=opt_report,
     )
 
 
@@ -421,6 +432,7 @@ class CheckConstraintsRequest(BaseModel):
     gc_window: int = Field(50, ge=20, le=200)
     uniquify_kmers: int = Field(10, ge=6, le=20)
     avoid_patterns: list[str] = Field(default_factory=list)
+    min_codon_frequency: float = Field(10.0, ge=0.0, le=100.0)
 
 
 class CheckConstraintsResponse(BaseModel):
@@ -430,11 +442,37 @@ class CheckConstraintsResponse(BaseModel):
     warnings: list[SequenceWarning]
 
 
+def _build_constraints(homo_gc: int, homo_at: int, gc_min: float, gc_max: float,
+                       gc_window: int, avoid_patterns: list[str]):
+    """Build the standard DNA Chisel constraint list used by both endpoints."""
+    from dnachisel import AvoidPattern, EnforceGCContent, EnforceTranslation
+    constraints = [EnforceTranslation()]
+    for base in "GC":
+        constraints.append(AvoidPattern(base * homo_gc))
+    for base in "AT":
+        constraints.append(AvoidPattern(base * homo_at))
+    constraints.append(EnforceGCContent(mini=gc_min, maxi=gc_max, window=gc_window))
+    for pat in avoid_patterns:
+        constraints.append(AvoidPattern(pat))
+    return constraints
+
+
 def _scan_warnings(dna: str, gc_min: float = 0.25, gc_max: float = 0.75,
-                    gc_window: int = 50) -> list[dict]:
+                    gc_window: int = 50,
+                    homo_gc: int = 4, homo_at: int = 6) -> list[dict]:
     """Scan for soft warnings — things worth knowing about but not constraint violations."""
     warnings = []
     s = dna.upper()
+
+    # Homopolymer runs
+    for base, threshold in [('G', homo_gc), ('C', homo_gc), ('A', homo_at), ('T', homo_at)]:
+        for m in re.finditer(f'{base}{{{threshold},}}', s):
+            warnings.append({
+                "kind": "homopolymer",
+                "message": f"{base}x{m.end() - m.start()} at {m.start()}-{m.end()}",
+                "start": m.start(),
+                "end": m.end(),
+            })
 
     # GC content in sliding windows — use same thresholds as constraints
     window = gc_window
@@ -590,16 +628,10 @@ def check_constraints(req: CheckConstraintsRequest):
     if bad:
         raise HTTPException(400, f"Non-DNA characters: {bad}")
 
-    constraints = [EnforceTranslation()]
-    for base in "GC":
-        constraints.append(AvoidPattern(base * req.avoid_homopolymers_gc))
-    for base in "AT":
-        constraints.append(AvoidPattern(base * req.avoid_homopolymers_at))
-    constraints.append(EnforceGCContent(
-        mini=req.gc_min, maxi=req.gc_max, window=req.gc_window
-    ))
-    for pat in req.avoid_patterns:
-        constraints.append(AvoidPattern(pat))
+    constraints = _build_constraints(
+        req.avoid_homopolymers_gc, req.avoid_homopolymers_at,
+        req.gc_min, req.gc_max, req.gc_window, req.avoid_patterns,
+    )
 
     problem = DnaOptimizationProblem(
         sequence=dna,
@@ -651,7 +683,8 @@ def check_constraints(req: CheckConstraintsRequest):
             "enforced": False,
         })
 
-    warnings = _scan_warnings(dna, gc_min=req.gc_min, gc_max=req.gc_max, gc_window=req.gc_window)
+    warnings = _scan_warnings(dna, gc_min=req.gc_min, gc_max=req.gc_max, gc_window=req.gc_window,
+                              homo_gc=req.avoid_homopolymers_gc, homo_at=req.avoid_homopolymers_at)
     # Add GC constraint warnings
     existing = {(w["kind"], w["start"], w["end"]) for w in warnings}
     for cw in constraint_warnings:

@@ -40,6 +40,12 @@ interface CodonOptResult {
   codons: CodonDetail[];
   codon_table: CodonTableEntry[];
   codon_table_name: string;
+  optimization_report?: {
+    ideal_score: number;
+    chosen_score: number;
+    total_loss: number;
+    codons_changed: number;
+  };
 }
 
 interface CodonOptPageProps {
@@ -59,6 +65,7 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
   const [gcMax, setGcMax] = useState(75);
   const [gcWindow, setGcWindow] = useState(50);
   const [uniquifyKmers, setUniquifyKmers] = useState(10);
+  const [minCodonFrequency, setMinCodonFrequency] = useState(10);
   const [avoidPatterns, setAvoidPatterns] = useState("");
   const [tables, setTables] = useState<string[]>([]);
   const [customTables, setCustomTables] = useState<string[]>([]);
@@ -124,6 +131,7 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
         gc_window: gcWindow,
         uniquify_kmers: uniquifyKmers,
         avoid_patterns: patterns,
+        min_codon_frequency: minCodonFrequency,
       };
 
       if (useCustomTable && customTable.trim()) {
@@ -167,7 +175,7 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
     // Push current state onto undo history before applying the change
     const currentDna = editedDna ?? result.optimized_dna;
     const currentCodons = editedCodons ?? result.codons;
-    setCodonHistory((prev) => [...prev, { dna: currentDna, codons: currentCodons }]);
+    setCodonHistory((prev) => [...prev, { dna: currentDna, codons: currentCodons }].slice(-50));
 
     const lookup = codonLookup(result.codon_table);
     const newCodons: CodonDetail[] = [];
@@ -183,14 +191,16 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
     setEditedDna(newDna);
     setEditedCodons(newCodons);
     onDnaChanged?.(newDna);
+    recheckConstraints(newDna);
+  }
 
-    // Re-check constraints with current settings
+  function recheckConstraints(dnaToCheck: string) {
     const patterns = avoidPatterns.split(",").map((s) => s.trim()).filter(Boolean);
     fetch(`${API_URL}/api/check-constraints`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        dna_sequence: newDna,
+        dna_sequence: dnaToCheck,
         avoid_homopolymers_gc: avoidHomopolymersGC,
         avoid_homopolymers_at: avoidHomopolymersAT,
         gc_min: gcMin / 100,
@@ -198,6 +208,7 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
         gc_window: gcWindow,
         uniquify_kmers: uniquifyKmers,
         avoid_patterns: patterns,
+        min_codon_frequency: minCodonFrequency,
       }),
     })
       .then((r) => r.json())
@@ -212,26 +223,7 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
     setEditedDna(prev.dna);
     setEditedCodons(prev.codons);
     onDnaChanged?.(prev.dna);
-
-    // Re-check constraints for the restored state
-    const patterns = avoidPatterns.split(",").map((s) => s.trim()).filter(Boolean);
-    fetch(`${API_URL}/api/check-constraints`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        dna_sequence: prev.dna,
-        avoid_homopolymers_gc: avoidHomopolymersGC,
-        avoid_homopolymers_at: avoidHomopolymersAT,
-        gc_min: gcMin / 100,
-        gc_max: gcMax / 100,
-        gc_window: gcWindow,
-        uniquify_kmers: uniquifyKmers,
-        avoid_patterns: patterns,
-      }),
-    })
-      .then((r) => r.json())
-      .then((d) => setEditedConstraints(d))
-      .catch(() => {});
+    recheckConstraints(prev.dna);
   }
 
   const currentDna = editedDna ?? result?.optimized_dna ?? "";
@@ -410,6 +402,17 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
               <tr>
                 <td className="py-1.5 pr-4 text-[#5f6368] whitespace-nowrap align-middle">
                   <span className="flex items-center gap-1">
+                    Min codon frequency (/1000)
+                    <InfoTip text="Minimum allowed codon usage frequency. Codons below this threshold are excluded during optimization to avoid rare codons that may reduce expression." />
+                  </span>
+                </td>
+                <td className="py-1.5 align-middle">
+                  <input type="number" value={minCodonFrequency} onChange={(e) => setMinCodonFrequency(Number(e.target.value))} onBlur={(e) => { e.target.value = String(minCodonFrequency); }} min={0} max={100} className="w-16 bg-white border border-[#dadce0] px-2 py-1 text-sm text-[#202124] focus:border-[#1a73e8] focus:outline-none" />
+                </td>
+              </tr>
+              <tr>
+                <td className="py-1.5 pr-4 text-[#5f6368] whitespace-nowrap align-middle">
+                  <span className="flex items-center gap-1">
                     Avoid patterns
                     <InfoTip text="DNA motifs to exclude, e.g. restriction sites. Comma-separated." />
                   </span>
@@ -482,7 +485,17 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
 
           {/* Constraints + detection checks */}
           {(() => {
-            const allChecks = editedConstraints?.constraints_summary ?? result.constraints_summary;
+            const allChecks = [...(editedConstraints?.constraints_summary ?? result.constraints_summary)];
+            // Add client-side min codon frequency check for live edits
+            if (editedConstraints && minCodonFrequency > 0) {
+              const belowFloor = currentCodons.filter((c) => c.per_thousand < minCodonFrequency);
+              allChecks.push({
+                constraint: `MinCodonFrequency(min:${minCodonFrequency}/1000)`,
+                passing: belowFloor.length === 0,
+                message: belowFloor.length === 0 ? "" : `${belowFloor.length} codon(s) below ${minCodonFrequency}/1000`,
+                enforced: true,
+              });
+            }
             const enforced = allChecks.filter((c) => c.enforced !== false);
             const detection = allChecks.filter((c) => c.enforced === false);
             return (
@@ -634,6 +647,34 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
               {currentDna}
             </pre>
           </div>
+
+          {/* Optimization report */}
+          {result.optimization_report && result.optimization_report.ideal_score > 0 && (
+            <div className="bg-white p-4 border border-[#dadce0]">
+              <h2 className="text-lg font-medium mb-3 text-[#202124]">Optimization Report</h2>
+              <div className="space-y-1 text-sm">
+                <div>
+                  <span className="text-[#5f6368]">Ideal score (all best codons):</span>{" "}
+                  {result.optimization_report.ideal_score.toFixed(1)}
+                </div>
+                <div>
+                  <span className="text-[#5f6368]">Chosen score (after constraints):</span>{" "}
+                  {result.optimization_report.chosen_score.toFixed(1)}
+                </div>
+                <div>
+                  <span className="text-[#5f6368]">Total loss:</span>{" "}
+                  {result.optimization_report.total_loss.toFixed(1)}{" "}
+                  <span className="text-[#80868b]">
+                    ({(100 * result.optimization_report.chosen_score / result.optimization_report.ideal_score).toFixed(1)}% of ideal)
+                  </span>
+                </div>
+                <div>
+                  <span className="text-[#5f6368]">Codons adjusted by optimizer:</span>{" "}
+                  {result.optimization_report.codons_changed} of {result.length_protein}
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Interactive codon track */}
           <CodonTrackViewer

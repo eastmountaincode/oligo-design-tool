@@ -35,9 +35,10 @@ export default function InfoTip({ text }: InfoTipProps) {
       } else if (tipRect.right > window.innerWidth - 8) {
         shift = window.innerWidth - 8 - tipRect.right;
       }
-      if (shift !== nudge) setNudge(shift);
+      setNudge(shift);
     }
-  }, [visible, anchor, nudge]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visible, anchor]);
 
   return (
     <>

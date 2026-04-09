@@ -1,75 +1,23 @@
 """
-Post-optimization GC refinement pass using dynamic programming.
+Global codon refinement using beam search with incremental constraint enforcement.
 
-DNA Chisel's greedy left-to-right solver can make suboptimal codon choices
-when resolving GC-content window constraints. It discovers violations at
-the end of a window and is forced to make large sacrifices on the last 1-2
-codons instead of spreading the cost across many codons.
+After DNA Chisel optimizes codons, this module re-examines all codon choices
+using a beam search that enforces GC windows, homopolymers, avoid patterns,
+and minimum codon frequency as hard constraints during the search — not as
+post-hoc validation.
 
-This module re-examines each GC-constrained window and uses DP to find the
-minimum-cost set of codon swaps that satisfies the constraint. "Cost" = total
-loss in codon frequency (/1000 score) relative to the best codon for each
-amino acid.
+The beam is bucketed by GC count in the current window to maintain spatial
+diversity, ensuring the search explores different GC distributions.
 """
 
 from __future__ import annotations
+import bisect
+import re
 from Bio.Seq import Seq
 
 
-def _gc_count(seq: str) -> int:
-    return sum(1 for b in seq if b in "GC")
-
-
-def _find_suboptimal_windows(dna: str, raw_table: dict, gc_max: float,
-                              gc_window: int) -> list[tuple[int, int]]:
-    """Find windows containing downgraded codons where GC is near the limit.
-
-    Returns (window_start, window_end) for windows where:
-    - At least one codon was downgraded from its best, AND
-    - GC content is within 10% of the limit (meaning GC pressure caused it)
-    """
-    n_codons = len(dna) // 3
-    regions = []
-
-    # Find codon positions where the current codon is not the best
-    downgraded = set()
-    for ci in range(n_codons):
-        codon = dna[ci*3:ci*3+3]
-        aa = str(Seq(codon).translate())
-        alts = raw_table.get(aa, {})
-        if not alts:
-            continue
-        best_score = max(alts.values())
-        cur_score = alts.get(codon, 0)
-        if cur_score < best_score * 0.9:  # significantly downgraded
-            downgraded.add(ci)
-
-    if not downgraded:
-        return []
-
-    # For each downgraded codon, check if it's in a high-GC window
-    for ci in sorted(downgraded):
-        nt_pos = ci * 3
-        # Check windows that contain this codon
-        for ws in range(max(0, nt_pos - gc_window + 3), min(len(dna) - gc_window + 1, nt_pos + 1)):
-            w = dna[ws:ws + gc_window]
-            gc_frac = _gc_count(w) / gc_window
-            # Window is near the GC max — this codon was likely downgraded for GC reasons
-            if gc_frac >= gc_max - 0.10:
-                regions.append((ws, ws + gc_window))
-                break
-
-    # Merge overlapping regions
-    if not regions:
-        return []
-    regions.sort()
-    merged = [regions[0]]
-    for s, e in regions[1:]:
-        if s <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
-        else:
-            merged.append((s, e))
-    return merged
+def _gc(seq: str) -> int:
+    return seq.count("G") + seq.count("C")
 
 
 def refine_gc_windows(
@@ -81,185 +29,219 @@ def refine_gc_windows(
     homo_gc: int,
     homo_at: int,
     avoid_patterns: list[str] | None = None,
-    max_iterations: int = 10,
-) -> str:
-    """Refine codon choices to minimize cost of GC constraint satisfaction.
+    min_codon_frequency: float = 10.0,
+) -> tuple[str, list[dict], dict]:
+    """Refine codon choices globally to minimize total frequency loss.
 
-    Runs after DNA Chisel. For each GC-constrained window where codons were
-    downgraded, uses DP to find the minimum total score loss that keeps GC%
-    within bounds.
+    All constraints are enforced during the search:
+    - GC content within [gc_min, gc_max] for every sliding window
+    - No G/C homopolymer runs >= homo_gc
+    - No A/T homopolymer runs >= homo_at
+    - No matches for avoid_patterns
+    - No codon with frequency < min_codon_frequency (when alternatives exist)
+
+    Returns (refined_dna, freq_warnings, optimization_report).
     """
-    if len(dna) < gc_window:
-        return dna
-
-    result = list(dna)
     n_codons = len(dna) // 3
+    if n_codons == 0:
+        return dna, [], {}
+
     aa_seq = [str(Seq(dna[i*3:i*3+3]).translate()) for i in range(n_codons)]
 
-    # Build alternatives: aa -> [(codon, per_thousand)] sorted by score desc
+    # Build alternatives per amino acid, sorted by score descending
     alt_cache: dict[str, list[tuple[str, float]]] = {}
     for aa, codons in raw_table.items():
         alt_cache[aa] = sorted(codons.items(), key=lambda x: -x[1])
 
-    # Find regions to refine (windows with downgraded codons near GC limit)
-    seq_str = "".join(result)
-    regions = _find_suboptimal_windows(seq_str, raw_table, gc_max, gc_window)
-
-    # Also add any remaining GC violations
-    for i in range(len(seq_str) - gc_window + 1):
-        w = seq_str[i:i + gc_window]
-        gc = _gc_count(w) / gc_window
-        if gc < gc_min or gc > gc_max:
-            regions.append((i, i + gc_window))
-
-    if not regions:
-        return dna
-
-    # Merge all regions
-    regions.sort()
-    merged = [regions[0]]
-    for s, e in regions[1:]:
-        if s <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+    # Per-position alternatives, filtered by min frequency
+    codon_alts: list[list[tuple[str, float]]] = []
+    best_scores: list[float] = []
+    for ci in range(n_codons):
+        aa = aa_seq[ci]
+        alts = alt_cache.get(aa, [])
+        if not alts:
+            alts = [(dna[ci*3:ci*3+3], 0.0)]
         else:
-            merged.append((s, e))
+            filtered = [(c, s) for c, s in alts if s >= min_codon_frequency]
+            if not filtered:
+                # No codon above floor — keep current as fallback
+                current = dna[ci*3:ci*3+3]
+                filtered = [(c, s) for c, s in alts if c == current]
+                if not filtered:
+                    filtered = [alts[0]]
+            alts = filtered
+        codon_alts.append(alts)
+        best_scores.append(alts[0][1])
 
-    for region_start, region_end in merged:
-        seq_str = "".join(result)
+    compiled_patterns = []
+    if avoid_patterns:
+        for pat in avoid_patterns:
+            if pat:
+                compiled_patterns.append(re.compile(pat))
 
-        # Codons overlapping this region
-        c_start = max(0, region_start // 3)
-        c_end = min(n_codons, (region_end + 2) // 3)
-        nuc_start = c_start * 3
-        nuc_end = c_end * 3
-        num_codons = c_end - c_start
+    # Beam search
+    # Each entry: (loss, tail, codon, parent)
+    #   tail: last tail_len bases for incremental constraint checking
+    #   parent: pointer to previous entry for sequence reconstruction
+    # Beam bucketed by window GC count for spatial diversity.
 
-        if num_codons == 0:
-            continue
+    tail_len = gc_window + 6
+    max_homo = max(homo_gc, homo_at)
+    BEAM_K = 15  # entries per GC bucket
 
-        # Get alternatives for each codon in the region
-        codon_alts: list[list[tuple[str, float]]] = []
-        for ci in range(c_start, c_end):
-            aa = aa_seq[ci]
-            alts = alt_cache.get(aa, [])
-            if not alts:
-                current = "".join(result[ci*3:ci*3+3])
-                alts = [(current, 0.0)]
-            codon_alts.append(alts)
+    class Entry:
+        __slots__ = ("loss", "tail", "codon", "parent")
+        def __init__(self, loss: float, tail: str, codon: str | None, parent: "Entry | None"):
+            self.loss = loss
+            self.tail = tail
+            self.codon = codon
+            self.parent = parent
 
-        # For each codon, compute the best possible score
-        best_scores = []
-        for ci_local in range(num_codons):
-            best_scores.append(codon_alts[ci_local][0][1])
+    root = Entry(0.0, "", None, None)
+    beam: dict[int, list[Entry]] = {0: [root]}
 
-        # DP: minimize total loss (sum of best_score - chosen_score)
-        # State: dp[gc_count] = (min_total_loss, choices)
-        max_gc = num_codons * 3
-        INF = float("inf")
-        dp: list[tuple[float, list[str]]] = [(INF, []) for _ in range(max_gc + 1)]
-        dp[0] = (0.0, [])
+    for ci in range(n_codons):
+        new_beam: dict[int, list[Entry]] = {}
+        placed = (ci + 1) * 3
 
-        for ci_local in range(num_codons):
-            new_dp: list[tuple[float, list[str]]] = [(INF, []) for _ in range(max_gc + 1)]
+        for entries in beam.values():
+            for entry in entries:
+                for alt_codon, alt_score in codon_alts[ci]:
+                    new_loss = entry.loss + (best_scores[ci] - alt_score)
+                    new_tail = (entry.tail + alt_codon)[-tail_len:]
 
-            for prev_gc in range(max_gc + 1):
-                if dp[prev_gc][0] >= INF:
-                    continue
-                prev_loss, prev_choices = dp[prev_gc]
+                    # GC window check: up to 3 newly complete windows
+                    if placed >= gc_window:
+                        gc_ok = True
+                        for offset in range(3):
+                            w_end = len(new_tail) - offset
+                            w_start = w_end - gc_window
+                            if w_start < 0:
+                                continue
+                            gc_frac = _gc(new_tail[w_start:w_end]) / gc_window
+                            if gc_frac < gc_min or gc_frac > gc_max:
+                                gc_ok = False
+                                break
+                        if not gc_ok:
+                            continue
 
-                for alt_codon, alt_score in codon_alts[ci_local]:
-                    alt_gc = _gc_count(alt_codon)
-                    new_gc = prev_gc + alt_gc
-                    if new_gc > max_gc:
+                    # Homopolymer check at boundary
+                    region = new_tail[-(max_homo + 2):] if len(new_tail) > max_homo + 2 else new_tail
+                    homo_ok = True
+                    for base in "GC":
+                        if base * homo_gc in region:
+                            homo_ok = False
+                            break
+                    if homo_ok:
+                        for base in "AT":
+                            if base * homo_at in region:
+                                homo_ok = False
+                                break
+                    if not homo_ok:
                         continue
 
-                    loss = best_scores[ci_local] - alt_score
-                    total_loss = prev_loss + loss
+                    # Avoid-pattern check at boundary
+                    if compiled_patterns:
+                        pat_ok = True
+                        for pat in compiled_patterns:
+                            if pat.search(new_tail):
+                                pat_ok = False
+                                break
+                        if not pat_ok:
+                            continue
 
-                    if total_loss < new_dp[new_gc][0]:
-                        new_dp[new_gc] = (total_loss, prev_choices + [alt_codon])
+                    # Bucket by window GC for diversity
+                    wgc = _gc(new_tail[-gc_window:]) if len(new_tail) >= gc_window else _gc(new_tail)
 
-            dp = new_dp
+                    new_entry = Entry(new_loss, new_tail, alt_codon, entry)
+                    bucket = new_beam.get(wgc)
+                    if bucket is None:
+                        new_beam[wgc] = [new_entry]
+                    elif len(bucket) < BEAM_K:
+                        bisect.insort(bucket, new_entry, key=lambda e: e.loss)
+                    elif new_loss < bucket[-1].loss:
+                        bucket.pop()
+                        bisect.insort(bucket, new_entry, key=lambda e: e.loss)
 
-        # Find the best solution that satisfies all GC windows + other constraints
-        # Get current total loss for comparison
-        current_loss = 0.0
-        for ci_local in range(num_codons):
-            ci = c_start + ci_local
-            current_codon = "".join(result[ci*3:ci*3+3])
-            current_score = raw_table.get(aa_seq[ci], {}).get(current_codon, 0)
-            current_loss += best_scores[ci_local] - current_score
+        beam = new_beam
+        if not beam:
+            # All candidates pruned — constraints unsatisfiable, return original
+            return dna, _freq_warnings(dna, n_codons, aa_seq, raw_table, alt_cache, min_codon_frequency), {}
 
-        best_solution_loss = current_loss
-        best_solution_choices: list[str] | None = None
+    # Best solution across all buckets
+    best: Entry | None = None
+    for entries in beam.values():
+        if entries and (best is None or entries[0].loss < best.loss):
+            best = entries[0]
 
-        for gc_total in range(max_gc + 1):
-            if dp[gc_total][0] >= INF:
-                continue
-            loss, choices = dp[gc_total]
+    if best is None:
+        return dna, _freq_warnings(dna, n_codons, aa_seq, raw_table, alt_cache, min_codon_frequency)
 
-            # Only consider solutions that are strictly better
-            if loss >= best_solution_loss:
-                continue
+    # Reconstruct sequence from parent chain
+    codons_rev: list[str] = []
+    curr: Entry | None = best
+    while curr is not None and curr.codon is not None:
+        codons_rev.append(curr.codon)
+        curr = curr.parent
+    codons_rev.reverse()
+    result_dna = "".join(codons_rev)
 
-            # Build candidate and validate
-            candidate = list(result)
-            for ci_local, codon in enumerate(choices):
-                ci = c_start + ci_local
-                for j, base in enumerate(codon):
-                    candidate[ci*3 + j] = base
+    # Only use result if it improves on the original
+    current_loss = sum(
+        best_scores[ci] - raw_table.get(aa_seq[ci], {}).get(dna[ci*3:ci*3+3], 0)
+        for ci in range(n_codons)
+    )
+    has_floor_violation = min_codon_frequency > 0 and any(
+        raw_table.get(aa_seq[ci], {}).get(dna[ci*3:ci*3+3], 0) < min_codon_frequency
+        for ci in range(n_codons)
+    )
+    if best.loss > current_loss and not has_floor_violation:
+        result_dna = dna
 
-            cand_str = "".join(candidate)
+    # Optimization report
+    ideal_score = sum(best_scores)
+    chosen_score = sum(
+        raw_table.get(aa_seq[ci], {}).get(result_dna[ci*3:ci*3+3], 0)
+        for ci in range(n_codons)
+    )
+    report = {
+        "ideal_score": round(ideal_score, 1),
+        "chosen_score": round(chosen_score, 1),
+        "total_loss": round(ideal_score - chosen_score, 1),
+        "codons_changed": sum(
+            1 for ci in range(n_codons)
+            if result_dna[ci*3:ci*3+3] != dna[ci*3:ci*3+3]
+        ),
+    }
 
-            # Check ALL GC windows overlapping the modified region
-            check_start = max(0, nuc_start - gc_window + 1)
-            check_end = min(len(dna) - gc_window + 1, nuc_end)
-            gc_ok = True
-            for ws in range(check_start, check_end):
-                w = cand_str[ws:ws + gc_window]
-                gc_frac = _gc_count(w) / gc_window
-                if gc_frac < gc_min or gc_frac > gc_max:
-                    gc_ok = False
-                    break
-            if not gc_ok:
-                continue
+    return result_dna, _freq_warnings(result_dna, n_codons, aa_seq, raw_table, alt_cache, min_codon_frequency), report
 
-            # Check homopolymer constraints
-            context_start = max(0, nuc_start - max(homo_gc, homo_at))
-            context_end = min(len(dna), nuc_end + max(homo_gc, homo_at))
-            context = cand_str[context_start:context_end]
-            homo_ok = True
-            for base in "GC":
-                if base * homo_gc in context:
-                    homo_ok = False
-                    break
-            if homo_ok:
-                for base in "AT":
-                    if base * homo_at in context:
-                        homo_ok = False
-                        break
-            if not homo_ok:
-                continue
 
-            # Check avoid_patterns
-            if avoid_patterns:
-                import re
-                pattern_ok = True
-                for pat in avoid_patterns:
-                    if re.search(pat, cand_str[nuc_start:nuc_end]):
-                        pattern_ok = False
-                        break
-                if not pattern_ok:
-                    continue
-
-            best_solution_loss = loss
-            best_solution_choices = choices
-
-        # Apply if we found something better
-        if best_solution_choices is not None:
-            for ci_local, codon in enumerate(best_solution_choices):
-                ci = c_start + ci_local
-                for j, base in enumerate(codon):
-                    result[ci*3 + j] = base
-
-    return "".join(result)
+def _freq_warnings(
+    dna: str, n_codons: int, aa_seq: list[str],
+    raw_table: dict, alt_cache: dict, min_codon_frequency: float,
+) -> list[dict]:
+    """Warnings for codons still below the frequency floor."""
+    warnings: list[dict] = []
+    if min_codon_frequency <= 0:
+        return warnings
+    for ci in range(n_codons):
+        codon = dna[ci*3:ci*3+3]
+        aa = aa_seq[ci]
+        score = raw_table.get(aa, {}).get(codon, 0)
+        if score < min_codon_frequency:
+            has_better = any(s >= min_codon_frequency for _, s in alt_cache.get(aa, []))
+            reason = (
+                "other constraints (GC%, homopolymer, avoid pattern) prevent using a higher-frequency codon"
+                if has_better else
+                f"no {aa} codon in this table has frequency >= {min_codon_frequency}/1000"
+            )
+            warnings.append({
+                "kind": "low_codon_frequency",
+                "message": f"{codon} ({aa}) at pos {ci*3}: {score:.1f}/1000 — {reason}",
+                "start": ci * 3,
+                "end": ci * 3 + 3,
+                "codon_index": ci,
+                "frequency": score,
+            })
+    return warnings
