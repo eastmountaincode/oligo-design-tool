@@ -36,7 +36,7 @@ export default function OverlapTooltip({ overlap, onClose }: Props) {
             </tr>
           )}
           <tr>
-            <td className="text-[#5f6368] pr-6 py-0.5 align-top">Sequence</td>
+            <td className="text-[#5f6368] pr-6 py-0.5 align-top">Sequence <span className="text-xs">(sense, 5&apos;-3&apos;)</span></td>
             <td className="py-0.5">
               <span className="font-mono text-xs break-all select-all">{overlap.seq}</span>
             </td>

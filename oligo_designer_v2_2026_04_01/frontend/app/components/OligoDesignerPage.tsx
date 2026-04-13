@@ -501,8 +501,9 @@ export default function OligoDesignerPage({ liveDna }: OligoDesignerPageProps) {
             </summary>
             <div className="px-4 pb-4 text-sm text-[#202124]">
               <p className="mb-3">
-                Overlap melting temperatures are computed using the <strong>SantaLucia (1998) nearest-neighbor model</strong> via
-                the primer3 library (<code className="text-xs bg-[#f8f9fa] px-1">calc_tm</code>).
+                Overlap melting temperatures are computed using the <strong>SantaLucia (1998) nearest-neighbor model</strong> for
+                base-stacking thermodynamics, with the <strong>Owczarzy (2008) salt correction</strong> applied for Mg²⁺,
+                via the primer3 library (<code className="text-xs bg-[#f8f9fa] px-1">calc_tm</code>).
               </p>
 
               <div className="bg-[#f8f9fa] border border-[#dadce0] p-3 font-mono text-xs mb-3">
@@ -550,9 +551,10 @@ export default function OligoDesignerPage({ liveDna }: OligoDesignerPageProps) {
               </table>
 
               <p className="text-[#5f6368] text-xs mb-2">
-                Salt correction: ΔS is adjusted for ionic strength using the SantaLucia 1998 Na⁺ correction
-                (ΔS<sub>corrected</sub> = ΔS + 0.368 × (N−1) × ln[Na⁺]). When Mg²⁺ is present, primer3 applies
-                an additional correction.
+                Salt correction: ΔS is adjusted for ionic strength using the <strong>Owczarzy 2008</strong> empirical
+                model (Owczarzy et al., <em>Biochemistry</em> 47:5336), which captures Mg²⁺ effects more accurately
+                than the SantaLucia Na⁺-only correction. This matters because assembly buffers contain Mg²⁺
+                and dNTPs that bind Mg²⁺, both of which shift the effective ionic strength.
               </p>
 
               <p className="text-[#5f6368] text-xs">

@@ -60,16 +60,29 @@ export default function OverlapRegion({
         strokeDasharray="3,3"
       />
       {showNumbers && w > 20 && (
-        <text
-          x={x + w / 2}
-          y={layout.CENTER_Y + 4}
-          textAnchor="middle"
-          fill={color}
-          fontSize={9}
-          opacity={0.7}
-        >
-          {overlap.end - overlap.start}bp
-        </text>
+        <>
+          <text
+            x={x + w / 2}
+            y={layout.CENTER_Y - 1}
+            textAnchor="middle"
+            fill={color}
+            fontSize={10}
+            fontWeight="bold"
+            opacity={0.85}
+          >
+            {overlap.index}
+          </text>
+          <text
+            x={x + w / 2}
+            y={layout.CENTER_Y + 10}
+            textAnchor="middle"
+            fill={color}
+            fontSize={9}
+            opacity={0.7}
+          >
+            {overlap.end - overlap.start}bp
+          </text>
+        </>
       )}
     </g>
   );

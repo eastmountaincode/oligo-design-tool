@@ -30,6 +30,8 @@ def refine_gc_windows(
     homo_at: int,
     avoid_patterns: list[str] | None = None,
     min_codon_frequency: float = 10.0,
+    beam_k: int = 15,
+    progress_callback=None,
 ) -> tuple[str, list[dict], dict]:
     """Refine codon choices globally to minimize total frequency loss.
 
@@ -87,7 +89,7 @@ def refine_gc_windows(
 
     tail_len = gc_window + 6
     max_homo = max(homo_gc, homo_at)
-    BEAM_K = 15  # entries per GC bucket
+    BEAM_K = max(1, beam_k)  # entries per bucket
 
     class Entry:
         __slots__ = ("loss", "tail", "codon", "parent")
@@ -98,10 +100,16 @@ def refine_gc_windows(
             self.parent = parent
 
     root = Entry(0.0, "", None, None)
-    beam: dict[int, list[Entry]] = {0: [root]}
+    # Bucket key: (window_gc_count, last_codon_gc_count). The second dimension
+    # diversifies paths whose GC totals match but whose tails differ — those
+    # have different futures because the next sliding window will see different
+    # bases falling out.
+    beam: dict[tuple[int, int], list[Entry]] = {(0, 0): [root]}
 
     for ci in range(n_codons):
-        new_beam: dict[int, list[Entry]] = {}
+        if progress_callback is not None:
+            progress_callback(ci, n_codons)
+        new_beam: dict[tuple[int, int], list[Entry]] = {}
         placed = (ci + 1) * 3
 
         for entries in beam.values():
@@ -150,13 +158,15 @@ def refine_gc_windows(
                         if not pat_ok:
                             continue
 
-                    # Bucket by window GC for diversity
+                    # Bucket by (window GC, last-codon GC) for diversity
                     wgc = _gc(new_tail[-gc_window:]) if len(new_tail) >= gc_window else _gc(new_tail)
+                    cgc = _gc(alt_codon)
+                    bkey = (wgc, cgc)
 
                     new_entry = Entry(new_loss, new_tail, alt_codon, entry)
-                    bucket = new_beam.get(wgc)
+                    bucket = new_beam.get(bkey)
                     if bucket is None:
-                        new_beam[wgc] = [new_entry]
+                        new_beam[bkey] = [new_entry]
                     elif len(bucket) < BEAM_K:
                         bisect.insort(bucket, new_entry, key=lambda e: e.loss)
                     elif new_loss < bucket[-1].loss:
@@ -166,7 +176,9 @@ def refine_gc_windows(
         beam = new_beam
         if not beam:
             # All candidates pruned — constraints unsatisfiable, return original
-            return dna, _freq_warnings(dna, n_codons, aa_seq, raw_table, alt_cache, min_codon_frequency), {}
+            return dna, _freq_warnings(dna, n_codons, aa_seq, raw_table, alt_cache, min_codon_frequency), _early_report(
+                "beam_pruned_empty", BEAM_K, dna, n_codons, aa_seq, raw_table, best_scores,
+            )
 
     # Best solution across all buckets
     best: Entry | None = None
@@ -175,7 +187,9 @@ def refine_gc_windows(
             best = entries[0]
 
     if best is None:
-        return dna, _freq_warnings(dna, n_codons, aa_seq, raw_table, alt_cache, min_codon_frequency)
+        return dna, _freq_warnings(dna, n_codons, aa_seq, raw_table, alt_cache, min_codon_frequency), _early_report(
+            "beam_no_solution", BEAM_K, dna, n_codons, aa_seq, raw_table, best_scores,
+        )
 
     # Reconstruct sequence from parent chain
     codons_rev: list[str] = []
@@ -195,8 +209,10 @@ def refine_gc_windows(
         raw_table.get(aa_seq[ci], {}).get(dna[ci*3:ci*3+3], 0) < min_codon_frequency
         for ci in range(n_codons)
     )
+    used_fallback = False
     if best.loss > current_loss and not has_floor_violation:
         result_dna = dna
+        used_fallback = True
 
     # Optimization report
     ideal_score = sum(best_scores)
@@ -212,9 +228,36 @@ def refine_gc_windows(
             1 for ci in range(n_codons)
             if result_dna[ci*3:ci*3+3] != dna[ci*3:ci*3+3]
         ),
+        "source": "dna_chisel_fallback" if used_fallback else "beam",
+        "chisel_score": round(ideal_score - current_loss, 1),
+        "beam_score": round(ideal_score - best.loss, 1),
+        "chisel_loss": round(current_loss, 1),
+        "beam_loss": round(best.loss, 1),
+        "beam_k": BEAM_K,
     }
 
     return result_dna, _freq_warnings(result_dna, n_codons, aa_seq, raw_table, alt_cache, min_codon_frequency), report
+
+
+def _early_report(source: str, beam_k: int, dna: str, n_codons: int,
+                  aa_seq: list, raw_table: dict, best_scores: list) -> dict:
+    """Build a partial optimization report for early-return paths so the
+    frontend can still display ideal/chisel scores when the beam fails."""
+    ideal_score = sum(best_scores)
+    chisel_score = sum(
+        raw_table.get(aa_seq[ci], {}).get(dna[ci*3:ci*3+3], 0)
+        for ci in range(n_codons)
+    )
+    return {
+        "source": source,
+        "beam_k": beam_k,
+        "ideal_score": round(ideal_score, 1),
+        "chosen_score": round(chisel_score, 1),
+        "total_loss": round(ideal_score - chisel_score, 1),
+        "chisel_score": round(chisel_score, 1),
+        "chisel_loss": round(ideal_score - chisel_score, 1),
+        "codons_changed": 0,
+    }
 
 
 def _freq_warnings(

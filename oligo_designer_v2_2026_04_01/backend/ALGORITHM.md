@@ -96,7 +96,8 @@ closest to 50%.
 
 - **Tm (melting temperature):** Slim said not to worry about Tm *matching*
   across overlaps. However, Tm is now computed for each overlap using the
-  primer3 nearest-neighbor model (SantaLucia 1998) and reported in the output.
+  primer3 nearest-neighbor model (SantaLucia 1998 stacking thermodynamics
+  with Owczarzy 2008 Mg²⁺ salt correction) and reported in the output.
   This also enables thermodynamic cross-hybridization checking (see Step 5).
 
 ## Step 4: Build oligos from optimized cut points
@@ -127,8 +128,11 @@ still displayed as informational context.
 ### Thermodynamic analysis (primer3)
 
 Each overlap's **melting temperature (Tm)** is computed using the primer3
-nearest-neighbor model (SantaLucia 1998). This uses the actual stacking
-energies of each dinucleotide pair, not a simple %GC formula.
+nearest-neighbor model with **SantaLucia 1998** stacking thermodynamics and
+the **Owczarzy 2008** salt correction for Mg²⁺. This uses the actual stacking
+energies of each dinucleotide pair, not a simple %GC formula. The Owczarzy
+correction accounts for Mg²⁺ in the assembly buffer, which the SantaLucia
+Na⁺-only correction would miss.
 
 ### Cross-hybridization check (replaces string-matching uniqueness)
 
@@ -265,6 +269,61 @@ can make an informed judgment call.
 | Objective | Description |
 |-----------|-------------|
 | CodonOptimize | Maximize usage of high-frequency codons from the selected table |
+
+## Two-stage optimization: DNA Chisel + beam search refinement
+
+The pipeline runs two optimizers in sequence and keeps whichever produces lower
+total loss.
+
+**Stage 1 — DNA Chisel.** Reverse-translates the protein and resolves
+constraints via local backtracking search. It treats codon frequency as a
+soft objective. Its weakness is that it processes constraint breaches
+left-to-right and commits to early codon choices, sometimes hammering a
+single codon with a large frequency sacrifice when it could have spread a
+smaller cost across several positions.
+
+**Stage 2 — Beam search refinement** (`gc_refinement.py`). Re-optimizes
+*from scratch*, considering every synonymous codon at every position. At each
+codon position, candidate paths are extended one codon at a time and pruned
+against the same hard constraints (GC window, homopolymers, avoid patterns,
+min codon frequency). Paths are bucketed by `(window_gc_count,
+last_codon_gc_count)` to maintain spatial diversity, and the top `BEAM_K`
+paths per bucket survive.
+
+**Why beam, not exact DP.** Exact DP would require a state of `(position,
+last ~50 bases)` to check sliding-window GC. That's ~2^47 distinct states per
+position — infeasible. Beam search is the practical approximation: the
+buckets are a lossy form of state equivalence, and `BEAM_K` controls how many
+representatives per equivalence class survive.
+
+**Why both stages, not just beam.** DNA Chisel acts as a feasibility safety
+net: if the beam prunes itself into a corner, we still have DNA Chisel's
+output to fall back on. The final output picks whichever has lower loss; the
+optimization report reports `source: "beam"` or `source:
+"dna_chisel_fallback"` so this is observable.
+
+**Empirical loss/runtime tradeoff** (test_beam_k_sweep.py, 230 aa protein,
+GC 40-60%):
+
+| K | time | beam loss | chisel loss |
+|---|------|-----------|-------------|
+| 5 | 0.6s | 1900 | 5020 |
+| 15 | 0.4s | 1840 | 5420 |
+| 30 | 0.7s | 1790 | 6020 |
+| 60 | 1.5s | 1790 | 5380 |
+| 120 | 3.0s | 1800 | 5760 |
+| 250 | 6.3s | 1800 | 5660 |
+
+Beam consistently beats DNA Chisel by ~3000 loss points. Quality saturates
+around K=30; raising K further does not help on this test case. Default
+`BEAM_K=15` is exposed as a user parameter (`beam_k` in the API).
+
+## Progress streaming
+
+`POST /api/codon-optimize-stream` returns Server-Sent Events with progress
+ticks (`{type: "progress", stage: "dna_chisel"|"beam", current, total}`)
+and a final `{type: "result", data: ...}` event. The frontend consumes this
+to show a progress bar during long beam runs.
 
 ## Codon coloring in the track viewer
 

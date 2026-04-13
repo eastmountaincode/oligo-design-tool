@@ -3,8 +3,14 @@ FastAPI backend for oligo designer.
 Can run standalone or as a Vercel serverless function.
 """
 
+import asyncio
+import json
+import queue
+import threading
+import time
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from Bio.Seq import Seq
 import re
@@ -213,6 +219,7 @@ class CodonOptRequest(BaseModel):
     uniquify_kmers: int = Field(10, ge=6, le=20, description="Max repeated k-mer length to eliminate")
     avoid_patterns: list[str] = Field(default_factory=list, description="Additional patterns to avoid (regex)")
     min_codon_frequency: float = Field(10.0, ge=0.0, le=100.0, description="Minimum codon frequency (/1000) allowed")
+    beam_k: int = Field(250, ge=1, le=500, description="Beam search width per bucket. Higher = better quality, slower.")
 
 
 class CodonDetail(BaseModel):
@@ -242,6 +249,9 @@ class CodonOptResponse(BaseModel):
     length_dna: int
     length_protein: int
     gc_content: float
+    gc_window_min: float | None = None
+    gc_window_max: float | None = None
+    gc_window_size: int = 50
     constraints_pass: bool
     constraints_summary: list[dict]
     warnings: list[SequenceWarning]
@@ -251,8 +261,9 @@ class CodonOptResponse(BaseModel):
     optimization_report: dict = {}
 
 
-@app.post("/api/codon-optimize", response_model=CodonOptResponse)
-def codon_optimize(req: CodonOptRequest):
+def _run_codon_optimize(req: CodonOptRequest, progress_callback=None) -> CodonOptResponse:
+    """Core optimization pipeline. progress_callback(stage: str, current: int, total: int)
+    is called periodically so streaming endpoints can report progress."""
     from dnachisel import (
         DnaOptimizationProblem, CodonOptimize, AvoidPattern,
         EnforceGCContent, EnforceTranslation, UniquifyAllKmers,
@@ -323,7 +334,25 @@ def codon_optimize(req: CodonOptRequest):
 
     opt_dna = problem.sequence
 
-    # DP refinement: redistribute GC-fixing codon swaps to minimize score loss
+    # Beam search refinement: globally minimize loss while enforcing constraints.
+    # Throttle progress to ~50 events evenly spaced across n_codons so the bar
+    # advances smoothly without flooding the queue (GIL contention with the
+    # async event loop produces visible jumps if every codon emits an event).
+    def _make_beam_progress(n_codons: int):
+        if n_codons <= 0:
+            return None
+        step = max(1, n_codons // 50)
+        def cb(ci: int, n: int) -> None:
+            if progress_callback is None:
+                return
+            if ci % step == 0 or ci == n - 1:
+                progress_callback("beam", ci, n)
+                # Yield GIL so the asyncio loop can drain the SSE queue
+                time.sleep(0)
+        return cb
+
+    _beam_progress = _make_beam_progress(len(opt_dna) // 3)
+
     from gc_refinement import refine_gc_windows
     opt_dna, freq_warnings, opt_report = refine_gc_windows(
         opt_dna, raw_table,
@@ -331,6 +360,8 @@ def codon_optimize(req: CodonOptRequest):
         homo_gc=req.avoid_homopolymers_gc, homo_at=req.avoid_homopolymers_at,
         avoid_patterns=req.avoid_patterns,
         min_codon_frequency=req.min_codon_frequency,
+        beam_k=req.beam_k,
+        progress_callback=_beam_progress,
     )
 
     back_protein = str(Seq(opt_dna).translate())
@@ -345,6 +376,12 @@ def codon_optimize(req: CodonOptRequest):
         codons_detail.append(CodonDetail(
             amino_acid=aa, codon=codon, per_thousand=round(per_k, 1)
         ))
+
+    # Actual minimum codon frequency in the output sequence (diagnostic).
+    # The user can compare this against their requested floor to decide
+    # whether to manually raise it.
+    if codons_detail:
+        opt_report["min_frequency_achieved"] = round(min(c.per_thousand for c in codons_detail), 1)
 
     table_entries = []
     for aa in sorted(raw_table.keys()):
@@ -402,6 +439,7 @@ def codon_optimize(req: CodonOptRequest):
 
     all_pass = eval_problem.all_constraints_pass()
 
+    gc_lo, gc_hi = _gc_window_range(opt_dna, req.gc_window)
     return CodonOptResponse(
         input_protein=protein,
         optimized_dna=opt_dna,
@@ -409,6 +447,9 @@ def codon_optimize(req: CodonOptRequest):
         length_dna=len(opt_dna),
         length_protein=len(protein),
         gc_content=round(gc_content(opt_dna), 3),
+        gc_window_min=round(gc_lo, 3) if gc_lo is not None else None,
+        gc_window_max=round(gc_hi, 3) if gc_hi is not None else None,
+        gc_window_size=req.gc_window,
         constraints_pass=all_pass,
         constraints_summary=summary,
         warnings=[SequenceWarning(**w) for w in opt_warnings],
@@ -417,6 +458,58 @@ def codon_optimize(req: CodonOptRequest):
         codon_table_name=table_name,
         optimization_report=opt_report,
     )
+
+
+@app.post("/api/codon-optimize", response_model=CodonOptResponse)
+def codon_optimize(req: CodonOptRequest):
+    return _run_codon_optimize(req)
+
+
+@app.post("/api/codon-optimize-stream")
+async def codon_optimize_stream(req: CodonOptRequest):
+    """Streams Server-Sent Events with progress updates and the final result.
+
+    Event format (newline-delimited JSON, one event per line):
+      {"type":"progress","stage":"dna_chisel","current":0,"total":1}
+      {"type":"progress","stage":"beam","current":42,"total":300}
+      {"type":"result","data":{...CodonOptResponse...}}
+      {"type":"error","message":"..."}
+    """
+    q: queue.Queue = queue.Queue()
+    SENTINEL = object()
+
+    def emit_progress(stage: str, current: int, total: int) -> None:
+        q.put({"type": "progress", "stage": stage, "current": current, "total": total})
+
+    def worker() -> None:
+        try:
+            response = _run_codon_optimize(req, progress_callback=emit_progress)
+            q.put({"type": "result", "data": response.model_dump()})
+        except HTTPException as e:
+            q.put({"type": "error", "message": e.detail, "status": e.status_code})
+        except Exception as e:
+            q.put({"type": "error", "message": str(e), "status": 500})
+        finally:
+            q.put(SENTINEL)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    async def event_stream():
+        loop = asyncio.get_event_loop()
+        last_progress: tuple[str, int] | None = None
+        while True:
+            item = await loop.run_in_executor(None, q.get)
+            if item is SENTINEL:
+                break
+            # Throttle progress events: only emit when stage or current value changes
+            if item.get("type") == "progress":
+                key = (item["stage"], item["current"])
+                if key == last_progress:
+                    continue
+                last_progress = key
+            yield f"data: {json.dumps(item)}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 # ---------------------------------------------------------------------------
@@ -455,6 +548,24 @@ def _build_constraints(homo_gc: int, homo_at: int, gc_min: float, gc_max: float,
     for pat in avoid_patterns:
         constraints.append(AvoidPattern(pat))
     return constraints
+
+
+def _gc_window_range(dna: str, window: int) -> tuple[float | None, float | None]:
+    """Return (min, max) GC fraction across all sliding windows of given size.
+    Returns (None, None) if the sequence is shorter than the window."""
+    s = dna.upper()
+    if len(s) < window:
+        return (None, None)
+    lo = 1.0
+    hi = 0.0
+    for i in range(0, len(s) - window + 1):
+        w = s[i:i + window]
+        gc = (w.count('G') + w.count('C')) / window
+        if gc < lo:
+            lo = gc
+        if gc > hi:
+            hi = gc
+    return (lo, hi)
 
 
 def _scan_warnings(dna: str, gc_min: float = 0.25, gc_max: float = 0.75,

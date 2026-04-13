@@ -7,6 +7,45 @@ import CodonTrackViewer from "./CodonTrackViewer";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
+// Number input that allows a transient empty string while editing — so the
+// user can clear the field and type a new value without it snapping to 0.
+function NumericInput({
+  value,
+  onChange,
+  className,
+  ...rest
+}: {
+  value: number;
+  onChange: (v: number) => void;
+  className?: string;
+} & Omit<React.InputHTMLAttributes<HTMLInputElement>, "value" | "onChange" | "type">) {
+  const [draft, setDraft] = useState<string | null>(null);
+  return (
+    <input
+      type="number"
+      value={draft ?? value}
+      className={className}
+      onChange={(e) => {
+        const v = e.target.value;
+        setDraft(v);
+        if (v !== "" && !Number.isNaN(Number(v))) {
+          onChange(Number(v));
+        }
+      }}
+      onBlur={() => {
+        if (draft === "" || draft === null) {
+          setDraft(null);
+          return;
+        }
+        const parsed = Number(draft);
+        if (!Number.isNaN(parsed)) onChange(parsed);
+        setDraft(null);
+      }}
+      {...rest}
+    />
+  );
+}
+
 interface CodonDetail {
   amino_acid: string;
   codon: string;
@@ -34,6 +73,9 @@ interface CodonOptResult {
   length_dna: number;
   length_protein: number;
   gc_content: number;
+  gc_window_min?: number | null;
+  gc_window_max?: number | null;
+  gc_window_size?: number;
   constraints_pass: boolean;
   constraints_summary: { constraint: string; passing: boolean; message: string; enforced?: boolean }[];
   warnings: SequenceWarning[];
@@ -45,6 +87,13 @@ interface CodonOptResult {
     chosen_score: number;
     total_loss: number;
     codons_changed: number;
+    source?: string;
+    chisel_score?: number;
+    beam_score?: number;
+    chisel_loss?: number;
+    beam_loss?: number;
+    beam_k?: number;
+    min_frequency_achieved?: number;
   };
 }
 
@@ -66,7 +115,9 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
   const [gcWindow, setGcWindow] = useState(50);
   const [uniquifyKmers, setUniquifyKmers] = useState(10);
   const [minCodonFrequency, setMinCodonFrequency] = useState(10);
+  const [beamK, setBeamK] = useState(250);
   const [avoidPatterns, setAvoidPatterns] = useState("");
+  const [progress, setProgress] = useState<{ stage: string; current: number; total: number } | null>(null);
   const [tables, setTables] = useState<string[]>([]);
   const [customTables, setCustomTables] = useState<string[]>([]);
   const [result, setResult] = useState<CodonOptResult | null>(null);
@@ -114,6 +165,7 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
     setEditedDna(null);
     setEditedCodons(null);
     setEditedConstraints(null);
+    setProgress(null);
     setLoading(true);
 
     try {
@@ -132,6 +184,7 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
         uniquify_kmers: uniquifyKmers,
         avoid_patterns: patterns,
         min_codon_frequency: minCodonFrequency,
+        beam_k: beamK,
       };
 
       if (useCustomTable && customTable.trim()) {
@@ -140,23 +193,61 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
         body.species = species;
       }
 
-      const res = await fetch(`${API_URL}/api/codon-optimize`, {
+      const res = await fetch(`${API_URL}/api/codon-optimize-stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-      if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.detail || "Optimization failed");
+      if (!res.ok || !res.body) {
+        throw new Error(`Optimization failed (${res.status})`);
       }
-      const data = await res.json();
-      setResult(data);
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let finalResult: CodonOptResult | null = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        const events = buffer.split("\n\n");
+        buffer = events.pop() ?? "";
+        for (const block of events) {
+          const line = block.split("\n").find((l) => l.startsWith("data: "));
+          if (!line) continue;
+          const payload = JSON.parse(line.slice(6));
+          if (payload.type === "progress") {
+            setProgress({ stage: payload.stage, current: payload.current, total: payload.total });
+            // Yield to React so it can paint this update before the next
+            // setProgress in the same chunk gets batched on top of it.
+            await new Promise((r) => setTimeout(r, 0));
+          } else if (payload.type === "result") {
+            // Snap the bar to 100% so the user visibly sees it complete
+            // before the result hides it.
+            if (payload.data?.length_protein) {
+              setProgress({ stage: "beam", current: payload.data.length_protein, total: payload.data.length_protein });
+              await new Promise((r) => setTimeout(r, 0));
+            }
+            finalResult = payload.data;
+          } else if (payload.type === "error") {
+            throw new Error(payload.message || "Optimization failed");
+          }
+        }
+      }
+
+      if (!finalResult) {
+        throw new Error("No result received from server");
+      }
+      setResult(finalResult);
       setCodonHistory([]);
-      onDnaChanged?.(data.optimized_dna);
+      onDnaChanged?.(finalResult.optimized_dna);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Unknown error");
     } finally {
       setLoading(false);
+      setProgress(null);
     }
   }
 
@@ -347,7 +438,7 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
                   </span>
                 </td>
                 <td className="py-1.5 pr-6 align-middle">
-                  <input type="number" value={avoidHomopolymersGC} onChange={(e) => setAvoidHomopolymersGC(Number(e.target.value))} min={3} max={8} className="w-16 bg-white border border-[#dadce0] px-2 py-1 text-sm text-[#202124] focus:border-[#1a73e8] focus:outline-none" />
+                  <NumericInput value={avoidHomopolymersGC} onChange={setAvoidHomopolymersGC} min={3} max={8} className="w-16 bg-white border border-[#dadce0] px-2 py-1 text-sm text-[#202124] focus:border-[#1a73e8] focus:outline-none" />
                 </td>
                 <td className="py-1.5 pr-4 text-[#5f6368] whitespace-nowrap align-middle">
                   <span className="flex items-center gap-1">
@@ -356,7 +447,7 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
                   </span>
                 </td>
                 <td className="py-1.5 align-middle">
-                  <input type="number" value={avoidHomopolymersAT} onChange={(e) => setAvoidHomopolymersAT(Number(e.target.value))} min={3} max={8} className="w-16 bg-white border border-[#dadce0] px-2 py-1 text-sm text-[#202124] focus:border-[#1a73e8] focus:outline-none" />
+                  <NumericInput value={avoidHomopolymersAT} onChange={setAvoidHomopolymersAT} min={3} max={8} className="w-16 bg-white border border-[#dadce0] px-2 py-1 text-sm text-[#202124] focus:border-[#1a73e8] focus:outline-none" />
                 </td>
               </tr>
               <tr>
@@ -367,7 +458,7 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
                   </span>
                 </td>
                 <td className="py-1.5 pr-6 align-middle">
-                  <input type="number" value={gcMin} onChange={(e) => setGcMin(Number(e.target.value))} step={5} min={0} max={100} className="w-16 bg-white border border-[#dadce0] px-2 py-1 text-sm text-[#202124] focus:border-[#1a73e8] focus:outline-none" />
+                  <NumericInput value={gcMin} onChange={setGcMin} step={5} min={0} max={100} className="w-16 bg-white border border-[#dadce0] px-2 py-1 text-sm text-[#202124] focus:border-[#1a73e8] focus:outline-none" />
                 </td>
                 <td className="py-1.5 pr-4 text-[#5f6368] whitespace-nowrap align-middle">
                   <span className="flex items-center gap-1">
@@ -376,7 +467,7 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
                   </span>
                 </td>
                 <td className="py-1.5 pr-6 align-middle">
-                  <input type="number" value={gcMax} onChange={(e) => setGcMax(Number(e.target.value))} step={5} min={0} max={100} className="w-16 bg-white border border-[#dadce0] px-2 py-1 text-sm text-[#202124] focus:border-[#1a73e8] focus:outline-none" />
+                  <NumericInput value={gcMax} onChange={setGcMax} step={5} min={0} max={100} className="w-16 bg-white border border-[#dadce0] px-2 py-1 text-sm text-[#202124] focus:border-[#1a73e8] focus:outline-none" />
                 </td>
                 <td className="py-1.5 pr-4 text-[#5f6368] whitespace-nowrap align-middle">
                   <span className="flex items-center gap-1">
@@ -385,7 +476,7 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
                   </span>
                 </td>
                 <td className="py-1.5 align-middle">
-                  <input type="number" value={gcWindow} onChange={(e) => setGcWindow(Number(e.target.value))} min={20} max={200} className="w-16 bg-white border border-[#dadce0] px-2 py-1 text-sm text-[#202124] focus:border-[#1a73e8] focus:outline-none" />
+                  <NumericInput value={gcWindow} onChange={setGcWindow} min={20} max={200} className="w-16 bg-white border border-[#dadce0] px-2 py-1 text-sm text-[#202124] focus:border-[#1a73e8] focus:outline-none" />
                 </td>
               </tr>
               <tr>
@@ -396,7 +487,7 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
                   </span>
                 </td>
                 <td className="py-1.5 align-middle">
-                  <input type="number" value={uniquifyKmers} onChange={(e) => setUniquifyKmers(Number(e.target.value))} min={6} max={20} className="w-16 bg-white border border-[#dadce0] px-2 py-1 text-sm text-[#202124] focus:border-[#1a73e8] focus:outline-none" />
+                  <NumericInput value={uniquifyKmers} onChange={setUniquifyKmers} min={6} max={20} className="w-16 bg-white border border-[#dadce0] px-2 py-1 text-sm text-[#202124] focus:border-[#1a73e8] focus:outline-none" />
                 </td>
               </tr>
               <tr>
@@ -407,7 +498,18 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
                   </span>
                 </td>
                 <td className="py-1.5 align-middle">
-                  <input type="number" value={minCodonFrequency} onChange={(e) => setMinCodonFrequency(Number(e.target.value))} onBlur={(e) => { e.target.value = String(minCodonFrequency); }} min={0} max={100} className="w-16 bg-white border border-[#dadce0] px-2 py-1 text-sm text-[#202124] focus:border-[#1a73e8] focus:outline-none" />
+                  <NumericInput value={minCodonFrequency} onChange={setMinCodonFrequency} min={0} max={100} className="w-16 bg-white border border-[#dadce0] px-2 py-1 text-sm text-[#202124] focus:border-[#1a73e8] focus:outline-none" />
+                </td>
+              </tr>
+              <tr>
+                <td className="py-1.5 pr-4 text-[#5f6368] whitespace-nowrap align-middle">
+                  <span className="flex items-center gap-1">
+                    Beam width (K)
+                    <InfoTip text="Beam search width per bucket in the refinement step. Higher values explore more candidate sequences and find lower-loss solutions, but take longer. If it's slow, lower this." />
+                  </span>
+                </td>
+                <td className="py-1.5 align-middle">
+                  <NumericInput value={beamK} onChange={setBeamK} min={1} max={500} className="w-16 bg-white border border-[#dadce0] px-2 py-1 text-sm text-[#202124] focus:border-[#1a73e8] focus:outline-none" />
                 </td>
               </tr>
               <tr>
@@ -432,6 +534,24 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
         >
           {loading ? "Optimizing..." : "Optimize Codons"}
         </button>
+
+        {loading && (
+          <div className="mt-3">
+            <div className="flex items-center justify-between mb-1 text-xs text-[#5f6368]">
+              <span>
+                Beam search
+                {progress && progress.total > 0 && ` — codon ${progress.current} of ${progress.total}`}
+              </span>
+              <span>{progress && progress.total > 0 ? `${Math.round((progress.current / progress.total) * 100)}%` : ""}</span>
+            </div>
+            <div className="w-full h-1.5 bg-[#e8eaed] overflow-hidden">
+              <div
+                className="h-full bg-[#1a73e8] transition-all"
+                style={{ width: progress && progress.total > 0 ? `${(progress.current / progress.total) * 100}%` : "0%" }}
+              />
+            </div>
+          </div>
+        )}
       </form>
 
       {error && (
@@ -444,43 +564,60 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
         <div className="space-y-6">
           <div className="bg-white p-4 border border-[#dadce0]">
             <h2 className="text-lg font-medium mb-3 text-[#202124]">Summary</h2>
-            <div className="space-y-1 text-sm">
-              <div>
-                <span className="text-[#5f6368]">Protein length:</span>{" "}
-                {result.length_protein} aa
-              </div>
-              <div>
-                <span className="text-[#5f6368]">DNA length:</span>{" "}
-                {result.length_dna} bp
-              </div>
-              <div>
-                <span className="text-[#5f6368]">GC content:</span>{" "}
-                {((editedConstraints?.gc_content ?? result.gc_content) * 100).toFixed(1)}%
-              </div>
-              <div>
-                <span className="text-[#5f6368]">All constraints pass:</span>{" "}
-                {(() => {
-                  const pass = editedConstraints?.constraints_pass ?? result.constraints_pass;
-                  return (
-                    <span className={pass ? "text-[#188038]" : "text-[#d93025]"}>
-                      {pass ? "Yes" : "No"}
+            <table className="text-sm">
+              <tbody>
+                <tr>
+                  <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">Protein length</td>
+                  <td className="py-0.5">{result.length_protein} aa</td>
+                </tr>
+                <tr>
+                  <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">DNA length</td>
+                  <td className="py-0.5">{result.length_dna} bp</td>
+                </tr>
+                <tr>
+                  <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">GC content (overall)</td>
+                  <td className="py-0.5">{((editedConstraints?.gc_content ?? result.gc_content) * 100).toFixed(1)}%</td>
+                </tr>
+                {result.gc_window_min != null && result.gc_window_max != null && (
+                  <tr>
+                    <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">GC range ({result.gc_window_size}bp window)</td>
+                    <td className="py-0.5">
+                      {(result.gc_window_min * 100).toFixed(1)}% – {(result.gc_window_max * 100).toFixed(1)}%
+                      <span className="text-[#80868b] ml-2">
+                        (allowed {(gcMin).toFixed(0)}–{(gcMax).toFixed(0)}%)
+                      </span>
+                    </td>
+                  </tr>
+                )}
+                <tr>
+                  <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">All constraints pass</td>
+                  <td className="py-0.5">
+                    {(() => {
+                      const pass = editedConstraints?.constraints_pass ?? result.constraints_pass;
+                      return (
+                        <span className={pass ? "text-[#188038]" : "text-[#d93025]"}>
+                          {pass ? "Yes" : "No"}
+                        </span>
+                      );
+                    })()}
+                  </td>
+                </tr>
+                <tr>
+                  <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">Translation matches input</td>
+                  <td className="py-0.5">
+                    <span className={
+                      result.input_protein === result.back_translated_protein.replace(/\*$/, "")
+                        ? "text-[#188038]"
+                        : "text-[#d93025]"
+                    }>
+                      {result.input_protein === result.back_translated_protein.replace(/\*$/, "")
+                        ? "Yes"
+                        : "No"}
                     </span>
-                  );
-                })()}
-              </div>
-              <div>
-                <span className="text-[#5f6368]">Translation matches input:</span>{" "}
-                <span className={
-                  result.input_protein === result.back_translated_protein.replace(/\*$/, "")
-                    ? "text-[#188038]"
-                    : "text-[#d93025]"
-                }>
-                  {result.input_protein === result.back_translated_protein.replace(/\*$/, "")
-                    ? "Yes"
-                    : "No"}
-                </span>
-              </div>
-            </div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
           </div>
 
           {/* Constraints + detection checks */}
@@ -649,30 +786,67 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
           </div>
 
           {/* Optimization report */}
-          {result.optimization_report && result.optimization_report.ideal_score > 0 && (
+          {result.optimization_report && result.optimization_report.ideal_score != null && (
             <div className="bg-white p-4 border border-[#dadce0]">
               <h2 className="text-lg font-medium mb-3 text-[#202124]">Optimization Report</h2>
-              <div className="space-y-1 text-sm">
-                <div>
-                  <span className="text-[#5f6368]">Ideal score (all best codons):</span>{" "}
-                  {result.optimization_report.ideal_score.toFixed(1)}
-                </div>
-                <div>
-                  <span className="text-[#5f6368]">Chosen score (after constraints):</span>{" "}
-                  {result.optimization_report.chosen_score.toFixed(1)}
-                </div>
-                <div>
-                  <span className="text-[#5f6368]">Total loss:</span>{" "}
-                  {result.optimization_report.total_loss.toFixed(1)}{" "}
-                  <span className="text-[#80868b]">
-                    ({(100 * result.optimization_report.chosen_score / result.optimization_report.ideal_score).toFixed(1)}% of ideal)
-                  </span>
-                </div>
-                <div>
-                  <span className="text-[#5f6368]">Codons adjusted by optimizer:</span>{" "}
-                  {result.optimization_report.codons_changed} of {result.length_protein}
-                </div>
-              </div>
+              <table className="text-sm">
+                <tbody>
+                  <tr>
+                    <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">Ideal score (all best codons)</td>
+                    <td className="py-0.5">{result.optimization_report.ideal_score.toFixed(1)}</td>
+                  </tr>
+                  {result.optimization_report.chisel_score != null && result.optimization_report.chisel_loss != null && (
+                    <tr>
+                      <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">DNA Chisel score</td>
+                      <td className="py-0.5">
+                        {result.optimization_report.chisel_score.toFixed(1)}
+                        <span className="text-[#80868b] ml-2">(loss {result.optimization_report.chisel_loss.toFixed(1)})</span>
+                      </td>
+                    </tr>
+                  )}
+                  {result.optimization_report.beam_score != null && result.optimization_report.beam_loss != null && (
+                    <tr>
+                      <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">Beam search score</td>
+                      <td className="py-0.5">
+                        {result.optimization_report.beam_score.toFixed(1)}
+                        <span className="text-[#80868b] ml-2">(loss {result.optimization_report.beam_loss.toFixed(1)})</span>
+                      </td>
+                    </tr>
+                  )}
+                  <tr>
+                    <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">Chosen score</td>
+                    <td className="py-0.5">
+                      {result.optimization_report.chosen_score.toFixed(1)}
+                      <span className="text-[#80868b] ml-2">
+                        ({result.optimization_report.ideal_score > 0
+                          ? `${(100 * result.optimization_report.chosen_score / result.optimization_report.ideal_score).toFixed(1)}% of ideal, `
+                          : ""}
+                        {result.optimization_report.source === "beam" ? "beam" :
+                         result.optimization_report.source === "dna_chisel_fallback" ? "DNA Chisel fallback" :
+                         result.optimization_report.source === "beam_pruned_empty" ? "beam failed (constraints too tight) — using DNA Chisel" :
+                         result.optimization_report.source === "beam_no_solution" ? "beam found no solution — using DNA Chisel" :
+                         result.optimization_report.source}
+                        {result.optimization_report.source === "beam" && result.optimization_report.beam_k != null && ` K=${result.optimization_report.beam_k}`})
+                      </span>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">Codons adjusted by optimizer</td>
+                    <td className="py-0.5">{result.optimization_report.codons_changed} of {result.length_protein}</td>
+                  </tr>
+                  {result.optimization_report.min_frequency_achieved != null && (
+                    <tr>
+                      <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">Min codon frequency in output</td>
+                      <td className="py-0.5">
+                        {result.optimization_report.min_frequency_achieved.toFixed(1)}/1000
+                        <span className="text-[#80868b] ml-2">
+                          (requested floor {minCodonFrequency}/1000)
+                        </span>
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
             </div>
           )}
 
