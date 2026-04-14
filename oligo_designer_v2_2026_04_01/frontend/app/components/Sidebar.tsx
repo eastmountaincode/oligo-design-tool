@@ -3,7 +3,7 @@
 export type Tab = "oligo-designer" | "codon-opt";
 
 const TABS: { id: Tab; label: string; sublabel: string }[] = [
-  { id: "codon-opt", label: "DNA Chisel", sublabel: "Codon Optimization" },
+  { id: "codon-opt", label: "Codon Optimization", sublabel: "" },
   { id: "oligo-designer", label: "Oligo Designer", sublabel: "Tiling" },
 ];
 
@@ -30,11 +30,13 @@ export default function Sidebar({ activeTab, onTabChange }: SidebarProps) {
               }`}
             >
               <div className="font-medium">{tab.label}</div>
-              <div className={`text-xs mt-0.5 ${
-                activeTab === tab.id ? "text-[#1a73e8]/70" : "text-[#5f6368]"
-              }`}>
-                {tab.sublabel}
-              </div>
+              {tab.sublabel && (
+                <div className={`text-xs mt-0.5 ${
+                  activeTab === tab.id ? "text-[#1a73e8]/70" : "text-[#5f6368]"
+                }`}>
+                  {tab.sublabel}
+                </div>
+              )}
             </button>
           </li>
         ))}

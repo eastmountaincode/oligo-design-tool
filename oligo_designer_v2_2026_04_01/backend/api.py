@@ -265,7 +265,7 @@ def _run_codon_optimize(req: CodonOptRequest, progress_callback=None) -> CodonOp
     """Core optimization pipeline. progress_callback(stage: str, current: int, total: int)
     is called periodically so streaming endpoints can report progress."""
     from dnachisel import (
-        DnaOptimizationProblem, CodonOptimize, AvoidPattern,
+        DnaOptimizationProblem, AvoidPattern,
         EnforceGCContent, EnforceTranslation, UniquifyAllKmers,
         reverse_translate,
     )
@@ -279,26 +279,20 @@ def _run_codon_optimize(req: CodonOptRequest, progress_callback=None) -> CodonOp
     if protein.endswith("*"):
         protein = protein[:-1]
 
-    # Resolve codon table (used for both optimization and frequency lookup)
+    # Resolve codon table (used for frequency lookup by the beam search)
     if req.custom_codon_table:
-        # Pasted table text
         usage_table = parse_codon_table(req.custom_codon_table)
         if not usage_table:
             raise HTTPException(400, "Could not parse custom codon table")
-        objectives = [CodonOptimize(codon_usage_table=usage_table)]
         table_name = "Custom"
     elif req.species in CUSTOM_TABLES:
-        # Project-bundled custom table (e.g., HumColi)
         usage_table = parse_codon_table(CUSTOM_TABLES[req.species])
         if not usage_table:
             raise HTTPException(400, f"Could not parse bundled table: {req.species}")
-        objectives = [CodonOptimize(codon_usage_table=usage_table)]
         table_name = req.species
     else:
-        # Built-in species table from python_codon_tables
         import python_codon_tables as pct
         usage_table = pct.get_codons_table(req.species)
-        objectives = [CodonOptimize(species=req.species)]
         table_name = req.species
 
     # Build raw /1000 table (needed for both DP refinement and per-codon detail)
@@ -321,20 +315,46 @@ def _run_codon_optimize(req: CodonOptRequest, progress_callback=None) -> CodonOp
         req.gc_min, req.gc_max, req.gc_window, req.avoid_patterns,
     )
 
-    # Optimize (k-mer uniqueness is checked as a warning, not enforced as a
-    # constraint, so DNA Chisel always picks the best codons)
-    dna = reverse_translate(protein)
-    problem = DnaOptimizationProblem(
-        sequence=dna,
-        constraints=constraints,
-        objectives=objectives,
-    )
-    problem.resolve_constraints()
-    problem.optimize()
+    # Upfront feasibility check: if any amino acid in the protein has no codon
+    # clearing min_codon_frequency, the user's floor is impossible for this
+    # protein and table. Fail with a specific per-AA error before wasting time
+    # on the beam.
+    if req.min_codon_frequency > 0:
+        impossible: dict[str, float] = {}
+        for aa in set(protein):
+            if aa not in VALID_AA:
+                continue
+            codons_for_aa = raw_table.get(aa, {})
+            if not codons_for_aa:
+                continue
+            best = max(codons_for_aa.values())
+            if best < req.min_codon_frequency:
+                impossible[aa] = best
+        if impossible:
+            parts = []
+            for aa, best in sorted(impossible.items(), key=lambda kv: kv[1]):
+                positions = [i for i, a in enumerate(protein) if a == aa]
+                pos_preview = ", ".join(str(p) for p in positions[:3])
+                if len(positions) > 3:
+                    pos_preview += f", … ({len(positions)} total)"
+                parts.append(
+                    f"{aa} (best {best:.1f}/1000, positions {pos_preview})"
+                )
+            raise HTTPException(
+                400,
+                "Min codon frequency floor is impossible for this protein in "
+                f"the {table_name} table. No synonymous codon above "
+                f"{req.min_codon_frequency:.0f}/1000 exists for: "
+                + "; ".join(parts)
+                + f". Lower the floor to ≤ {min(impossible.values()):.1f}/1000 or use a different codon table."
+            )
 
-    opt_dna = problem.sequence
+    # Beam search is the sole optimizer. Start from a naive reverse translation
+    # — the beam only reads the amino acid sequence from this, so the starting
+    # codon choices are discarded.
+    opt_dna = reverse_translate(protein)
 
-    # Beam search refinement: globally minimize loss while enforcing constraints.
+    # Beam search: globally minimize loss while enforcing constraints.
     # Throttle progress to ~50 events evenly spaced across n_codons so the bar
     # advances smoothly without flooding the queue (GIL contention with the
     # async event loop produces visible jumps if every codon emits an event).
@@ -470,7 +490,6 @@ async def codon_optimize_stream(req: CodonOptRequest):
     """Streams Server-Sent Events with progress updates and the final result.
 
     Event format (newline-delimited JSON, one event per line):
-      {"type":"progress","stage":"dna_chisel","current":0,"total":1}
       {"type":"progress","stage":"beam","current":42,"total":300}
       {"type":"result","data":{...CodonOptResponse...}}
       {"type":"error","message":"..."}

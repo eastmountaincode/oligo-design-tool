@@ -5,7 +5,6 @@ import OligoDesignerPage from "./components/OligoDesignerPage";
 import CodonOptPage from "./components/CodonOptPage";
 
 export default function Home() {
-  // Live DNA flows from DNA Chisel → Oligo Designer automatically
   const [liveDna, setLiveDna] = useState("");
 
   const handleDnaChanged = useCallback((dna: string) => {
@@ -21,7 +20,7 @@ export default function Home() {
 
       {/* Side-by-side panels — fixed height, independent scroll */}
       <div className="flex h-[calc(100vh-49px)]">
-        {/* Left: DNA Chisel */}
+        {/* Left: Codon Optimization */}
         <div className="flex-1 border-r border-[#dadce0] overflow-y-auto">
           <div className="px-6 py-6">
             <CodonOptPage onDnaChanged={handleDnaChanged} />

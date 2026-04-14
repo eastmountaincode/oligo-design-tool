@@ -1,7 +1,7 @@
 """Empirical sweep over BEAM_K values to characterize loss/runtime tradeoff.
 
-Runs the full pipeline (DNA Chisel + beam refinement) on a tight-constraint
-test sequence at several K values and prints loss + wall time for each.
+Runs beam search on a tight-constraint test sequence at several K values
+and prints loss + wall time for each.
 """
 import time
 import sys
@@ -51,16 +51,14 @@ def run_one(beam_k: int) -> dict:
         "ideal_score": rep.get("ideal_score"),
         "codons_changed": rep.get("codons_changed"),
         "source": rep.get("source"),
-        "beam_loss": rep.get("beam_loss"),
-        "chisel_loss": rep.get("chisel_loss"),
     }
 
 
 def main() -> None:
     print(f"Protein length: {len(PROTEIN)} aa")
     print(f"DNA length: {len(PROTEIN) * 3} bp\n")
-    print(f"{'K':>5} {'time(s)':>10} {'loss':>10} {'beam_loss':>12} {'chisel_loss':>14} {'changed':>10} {'source':>22}")
-    print("-" * 90)
+    print(f"{'K':>5} {'time(s)':>10} {'loss':>10} {'changed':>10} {'source':>22}")
+    print("-" * 65)
     for k in [5, 15, 30, 60, 120, 250]:
         try:
             r = run_one(k)
@@ -68,8 +66,6 @@ def main() -> None:
                 f"{r['beam_k']:>5} "
                 f"{r['elapsed_s']:>10.2f} "
                 f"{r['total_loss']:>10.1f} "
-                f"{(r['beam_loss'] if r['beam_loss'] is not None else float('nan')):>12.1f} "
-                f"{(r['chisel_loss'] if r['chisel_loss'] is not None else float('nan')):>14.1f} "
                 f"{r['codons_changed']:>10} "
                 f"{str(r['source']):>22}"
             )

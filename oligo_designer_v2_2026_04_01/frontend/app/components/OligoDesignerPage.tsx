@@ -114,9 +114,9 @@ export default function OligoDesignerPage({ liveDna }: OligoDesignerPageProps) {
 
   return (
     <div>
-      <h1 className="text-xl font-semibold mb-2 text-[#202124]">Oligo Designer <span className="text-sm font-normal text-[#5f6368]">Tiling</span></h1>
+      <h1 className="text-xl font-semibold mb-2 text-[#202124]">Oligo Designer</h1>
       <p className="text-[#5f6368] mb-8">
-        Design overlapping oligos for gene synthesis via overlap extension assembly
+        Design overlapping oligos for gene synthesis
       </p>
 
       <form onSubmit={handleSubmit} className="space-y-4 mb-8">

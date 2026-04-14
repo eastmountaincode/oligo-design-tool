@@ -1,13 +1,14 @@
 """
-Global codon refinement using beam search with incremental constraint enforcement.
+Global codon optimization via beam search with incremental constraint enforcement.
 
-After DNA Chisel optimizes codons, this module re-examines all codon choices
-using a beam search that enforces GC windows, homopolymers, avoid patterns,
-and minimum codon frequency as hard constraints during the search — not as
-post-hoc validation.
+Given a starting DNA encoding the target protein, this module searches the full
+synonymous codon space for a sequence that minimizes total frequency loss while
+enforcing GC windows, homopolymers, avoid patterns, and minimum codon frequency
+as hard constraints during the search — not as post-hoc validation.
 
-The beam is bucketed by GC count in the current window to maintain spatial
-diversity, ensuring the search explores different GC distributions.
+The beam is bucketed by (window_gc, last_codon_gc) to preserve spatial diversity,
+so paths whose GC totals match but whose tail distributions differ survive in
+different buckets.
 """
 
 from __future__ import annotations
@@ -55,7 +56,9 @@ def refine_gc_windows(
     for aa, codons in raw_table.items():
         alt_cache[aa] = sorted(codons.items(), key=lambda x: -x[1])
 
-    # Per-position alternatives, filtered by min frequency
+    # Per-position alternatives, filtered by min frequency. The API-layer
+    # feasibility check has already verified that every AA has at least one
+    # codon above the floor, so the filtered list is guaranteed non-empty.
     codon_alts: list[list[tuple[str, float]]] = []
     best_scores: list[float] = []
     for ci in range(n_codons):
@@ -64,14 +67,7 @@ def refine_gc_windows(
         if not alts:
             alts = [(dna[ci*3:ci*3+3], 0.0)]
         else:
-            filtered = [(c, s) for c, s in alts if s >= min_codon_frequency]
-            if not filtered:
-                # No codon above floor — keep current as fallback
-                current = dna[ci*3:ci*3+3]
-                filtered = [(c, s) for c, s in alts if c == current]
-                if not filtered:
-                    filtered = [alts[0]]
-            alts = filtered
+            alts = [(c, s) for c, s in alts if s >= min_codon_frequency]
         codon_alts.append(alts)
         best_scores.append(alts[0][1])
 
@@ -175,8 +171,7 @@ def refine_gc_windows(
 
         beam = new_beam
         if not beam:
-            # All candidates pruned — constraints unsatisfiable, return original
-            return dna, _freq_warnings(dna, n_codons, aa_seq, raw_table, alt_cache, min_codon_frequency), _early_report(
+            return dna, _freq_warnings(dna, n_codons, aa_seq, raw_table, alt_cache, min_codon_frequency, beam_failed=True), _early_report(
                 "beam_pruned_empty", BEAM_K, dna, n_codons, aa_seq, raw_table, best_scores,
             )
 
@@ -187,7 +182,7 @@ def refine_gc_windows(
             best = entries[0]
 
     if best is None:
-        return dna, _freq_warnings(dna, n_codons, aa_seq, raw_table, alt_cache, min_codon_frequency), _early_report(
+        return dna, _freq_warnings(dna, n_codons, aa_seq, raw_table, alt_cache, min_codon_frequency, beam_failed=True), _early_report(
             "beam_no_solution", BEAM_K, dna, n_codons, aa_seq, raw_table, best_scores,
         )
 
@@ -200,21 +195,6 @@ def refine_gc_windows(
     codons_rev.reverse()
     result_dna = "".join(codons_rev)
 
-    # Only use result if it improves on the original
-    current_loss = sum(
-        best_scores[ci] - raw_table.get(aa_seq[ci], {}).get(dna[ci*3:ci*3+3], 0)
-        for ci in range(n_codons)
-    )
-    has_floor_violation = min_codon_frequency > 0 and any(
-        raw_table.get(aa_seq[ci], {}).get(dna[ci*3:ci*3+3], 0) < min_codon_frequency
-        for ci in range(n_codons)
-    )
-    used_fallback = False
-    if best.loss > current_loss and not has_floor_violation:
-        result_dna = dna
-        used_fallback = True
-
-    # Optimization report
     ideal_score = sum(best_scores)
     chosen_score = sum(
         raw_table.get(aa_seq[ci], {}).get(result_dna[ci*3:ci*3+3], 0)
@@ -224,15 +204,7 @@ def refine_gc_windows(
         "ideal_score": round(ideal_score, 1),
         "chosen_score": round(chosen_score, 1),
         "total_loss": round(ideal_score - chosen_score, 1),
-        "codons_changed": sum(
-            1 for ci in range(n_codons)
-            if result_dna[ci*3:ci*3+3] != dna[ci*3:ci*3+3]
-        ),
-        "source": "dna_chisel_fallback" if used_fallback else "beam",
-        "chisel_score": round(ideal_score - current_loss, 1),
-        "beam_score": round(ideal_score - best.loss, 1),
-        "chisel_loss": round(current_loss, 1),
-        "beam_loss": round(best.loss, 1),
+        "source": "beam",
         "beam_k": BEAM_K,
     }
 
@@ -241,10 +213,10 @@ def refine_gc_windows(
 
 def _early_report(source: str, beam_k: int, dna: str, n_codons: int,
                   aa_seq: list, raw_table: dict, best_scores: list) -> dict:
-    """Build a partial optimization report for early-return paths so the
-    frontend can still display ideal/chisel scores when the beam fails."""
+    """Partial report for early-return paths (beam failed). Scores reflect the
+    naive reverse-translation we fall back to, not a real optimized output."""
     ideal_score = sum(best_scores)
-    chisel_score = sum(
+    chosen_score = sum(
         raw_table.get(aa_seq[ci], {}).get(dna[ci*3:ci*3+3], 0)
         for ci in range(n_codons)
     )
@@ -252,19 +224,21 @@ def _early_report(source: str, beam_k: int, dna: str, n_codons: int,
         "source": source,
         "beam_k": beam_k,
         "ideal_score": round(ideal_score, 1),
-        "chosen_score": round(chisel_score, 1),
-        "total_loss": round(ideal_score - chisel_score, 1),
-        "chisel_score": round(chisel_score, 1),
-        "chisel_loss": round(ideal_score - chisel_score, 1),
-        "codons_changed": 0,
+        "chosen_score": round(chosen_score, 1),
+        "total_loss": round(ideal_score - chosen_score, 1),
     }
 
 
 def _freq_warnings(
     dna: str, n_codons: int, aa_seq: list[str],
     raw_table: dict, alt_cache: dict, min_codon_frequency: float,
+    beam_failed: bool = False,
 ) -> list[dict]:
-    """Warnings for codons still below the frequency floor."""
+    """Warnings for codons still below the frequency floor.
+
+    When beam_failed is True, the reason text reflects that no global
+    solution exists rather than claiming a per-codon constraint conflict.
+    """
     warnings: list[dict] = []
     if min_codon_frequency <= 0:
         return warnings
@@ -274,11 +248,12 @@ def _freq_warnings(
         score = raw_table.get(aa, {}).get(codon, 0)
         if score < min_codon_frequency:
             has_better = any(s >= min_codon_frequency for _, s in alt_cache.get(aa, []))
-            reason = (
-                "other constraints (GC%, homopolymer, avoid pattern) prevent using a higher-frequency codon"
-                if has_better else
-                f"no {aa} codon in this table has frequency >= {min_codon_frequency}/1000"
-            )
+            if beam_failed:
+                reason = f"below floor ({min_codon_frequency:.0f}/1000) — no global solution exists under current constraints"
+            elif has_better:
+                reason = "other constraints (GC%, homopolymer, avoid pattern) prevent using a higher-frequency codon"
+            else:
+                reason = f"no {aa} codon in this table has frequency >= {min_codon_frequency}/1000"
             warnings.append({
                 "kind": "low_codon_frequency",
                 "message": f"{codon} ({aa}) at pos {ci*3}: {score:.1f}/1000 — {reason}",

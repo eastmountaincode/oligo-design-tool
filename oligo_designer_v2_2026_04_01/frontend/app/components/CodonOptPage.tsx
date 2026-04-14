@@ -86,12 +86,7 @@ interface CodonOptResult {
     ideal_score: number;
     chosen_score: number;
     total_loss: number;
-    codons_changed: number;
     source?: string;
-    chisel_score?: number;
-    beam_score?: number;
-    chisel_loss?: number;
-    beam_loss?: number;
     beam_k?: number;
     min_frequency_achieved?: number;
   };
@@ -330,9 +325,9 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
 
   return (
     <div>
-      <h1 className="text-xl font-semibold mb-2 text-[#202124]">Codon Optimization <span className="text-sm font-normal text-[#5f6368]">DNA Chisel</span></h1>
+      <h1 className="text-xl font-semibold mb-2 text-[#202124]">Codon Optimization</h1>
       <p className="text-[#5f6368] mb-8">
-        Optimize a protein sequence for expression using DNA Chisel
+        Optimize a protein sequence for expression
       </p>
 
       <form onSubmit={handleSubmit} className="space-y-4 mb-8">
@@ -458,7 +453,7 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
                   </span>
                 </td>
                 <td className="py-1.5 pr-6 align-middle">
-                  <NumericInput value={gcMin} onChange={setGcMin} step={5} min={0} max={100} className="w-16 bg-white border border-[#dadce0] px-2 py-1 text-sm text-[#202124] focus:border-[#1a73e8] focus:outline-none" />
+                  <NumericInput value={gcMin} onChange={setGcMin} step={1} min={0} max={100} className="w-16 bg-white border border-[#dadce0] px-2 py-1 text-sm text-[#202124] focus:border-[#1a73e8] focus:outline-none" />
                 </td>
                 <td className="py-1.5 pr-4 text-[#5f6368] whitespace-nowrap align-middle">
                   <span className="flex items-center gap-1">
@@ -467,7 +462,7 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
                   </span>
                 </td>
                 <td className="py-1.5 pr-6 align-middle">
-                  <NumericInput value={gcMax} onChange={setGcMax} step={5} min={0} max={100} className="w-16 bg-white border border-[#dadce0] px-2 py-1 text-sm text-[#202124] focus:border-[#1a73e8] focus:outline-none" />
+                  <NumericInput value={gcMax} onChange={setGcMax} step={1} min={0} max={100} className="w-16 bg-white border border-[#dadce0] px-2 py-1 text-sm text-[#202124] focus:border-[#1a73e8] focus:outline-none" />
                 </td>
                 <td className="py-1.5 pr-4 text-[#5f6368] whitespace-nowrap align-middle">
                   <span className="flex items-center gap-1">
@@ -562,64 +557,6 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
 
       {result && (
         <div className="space-y-6">
-          <div className="bg-white p-4 border border-[#dadce0]">
-            <h2 className="text-lg font-medium mb-3 text-[#202124]">Summary</h2>
-            <table className="text-sm">
-              <tbody>
-                <tr>
-                  <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">Protein length</td>
-                  <td className="py-0.5">{result.length_protein} aa</td>
-                </tr>
-                <tr>
-                  <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">DNA length</td>
-                  <td className="py-0.5">{result.length_dna} bp</td>
-                </tr>
-                <tr>
-                  <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">GC content (overall)</td>
-                  <td className="py-0.5">{((editedConstraints?.gc_content ?? result.gc_content) * 100).toFixed(1)}%</td>
-                </tr>
-                {result.gc_window_min != null && result.gc_window_max != null && (
-                  <tr>
-                    <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">GC range ({result.gc_window_size}bp window)</td>
-                    <td className="py-0.5">
-                      {(result.gc_window_min * 100).toFixed(1)}% – {(result.gc_window_max * 100).toFixed(1)}%
-                      <span className="text-[#80868b] ml-2">
-                        (allowed {(gcMin).toFixed(0)}–{(gcMax).toFixed(0)}%)
-                      </span>
-                    </td>
-                  </tr>
-                )}
-                <tr>
-                  <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">All constraints pass</td>
-                  <td className="py-0.5">
-                    {(() => {
-                      const pass = editedConstraints?.constraints_pass ?? result.constraints_pass;
-                      return (
-                        <span className={pass ? "text-[#188038]" : "text-[#d93025]"}>
-                          {pass ? "Yes" : "No"}
-                        </span>
-                      );
-                    })()}
-                  </td>
-                </tr>
-                <tr>
-                  <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">Translation matches input</td>
-                  <td className="py-0.5">
-                    <span className={
-                      result.input_protein === result.back_translated_protein.replace(/\*$/, "")
-                        ? "text-[#188038]"
-                        : "text-[#d93025]"
-                    }>
-                      {result.input_protein === result.back_translated_protein.replace(/\*$/, "")
-                        ? "Yes"
-                        : "No"}
-                    </span>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-
           {/* Constraints + detection checks */}
           {(() => {
             const allChecks = [...(editedConstraints?.constraints_summary ?? result.constraints_summary)];
@@ -729,7 +666,15 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
                         >
                           <span className="text-[#80868b] flex-shrink-0 w-5 text-right text-xs">{i + 1}</span>
                           <span className="text-[#e37400] flex-shrink-0">
-                            {w.kind === "homopolymer" ? "HOMOPOLYMER" : w.kind === "gc_window" ? "GC" : "10-MER"}
+                            {w.kind === "homopolymer"
+                              ? "HOMOPOLYMER"
+                              : w.kind === "gc_window"
+                              ? "GC"
+                              : w.kind === "low_codon_frequency"
+                              ? "LOW FREQ"
+                              : w.kind === "repeat_kmer"
+                              ? "10-MER"
+                              : w.kind?.toUpperCase() ?? "WARNING"}
                           </span>
                           <span className="text-[#202124]">{w.message}</span>
                           {w.group != null && (
@@ -785,70 +730,122 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
             </pre>
           </div>
 
-          {/* Optimization report */}
-          {result.optimization_report && result.optimization_report.ideal_score != null && (
-            <div className="bg-white p-4 border border-[#dadce0]">
-              <h2 className="text-lg font-medium mb-3 text-[#202124]">Optimization Report</h2>
-              <table className="text-sm">
-                <tbody>
+          {/* Summary + optimization report */}
+          <div className="bg-white p-4 border border-[#dadce0]">
+            {(() => {
+              const src = result.optimization_report?.source;
+              const beamFailed = src === "beam_pruned_empty" || src === "beam_no_solution";
+              const floorViolations = (result.warnings ?? []).filter(
+                (w: { kind?: string }) => w.kind === "low_codon_frequency",
+              ).length;
+              if (!beamFailed) return null;
+              return (
+                <div className="mb-4 p-3 border-l-4 border-[#e37400] bg-[#fef7e0] text-sm text-[#202124]">
+                  <div className="font-medium mb-1">No solution found</div>
+                  <div>
+                    Beam search could not find any codon assignment that satisfies all constraints simultaneously
+                    (min codon frequency {minCodonFrequency}/1000, GC window, homopolymers, avoid patterns).
+                    Showing a naive top-codon translation{floorViolations > 0 ? ` — ${floorViolations} position${floorViolations === 1 ? "" : "s"} below floor` : ""}.
+                    Try lowering the min codon frequency, widening the GC band, or increasing beam K.
+                  </div>
+                </div>
+              );
+            })()}
+
+            <h3 className="text-sm font-medium text-[#5f6368] uppercase tracking-wide mb-2">Summary</h3>
+            <table className="text-sm mb-5">
+              <tbody>
+                <tr>
+                  <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">Protein length</td>
+                  <td className="py-0.5">{result.length_protein} aa</td>
+                </tr>
+                <tr>
+                  <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">DNA length</td>
+                  <td className="py-0.5">{result.length_dna} bp</td>
+                </tr>
+                <tr>
+                  <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">GC content (overall)</td>
+                  <td className="py-0.5">{((editedConstraints?.gc_content ?? result.gc_content) * 100).toFixed(1)}%</td>
+                </tr>
+                {result.gc_window_min != null && result.gc_window_max != null && (
                   <tr>
-                    <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">Ideal score (all best codons)</td>
-                    <td className="py-0.5">{result.optimization_report.ideal_score.toFixed(1)}</td>
-                  </tr>
-                  {result.optimization_report.chisel_score != null && result.optimization_report.chisel_loss != null && (
-                    <tr>
-                      <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">DNA Chisel score</td>
-                      <td className="py-0.5">
-                        {result.optimization_report.chisel_score.toFixed(1)}
-                        <span className="text-[#80868b] ml-2">(loss {result.optimization_report.chisel_loss.toFixed(1)})</span>
-                      </td>
-                    </tr>
-                  )}
-                  {result.optimization_report.beam_score != null && result.optimization_report.beam_loss != null && (
-                    <tr>
-                      <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">Beam search score</td>
-                      <td className="py-0.5">
-                        {result.optimization_report.beam_score.toFixed(1)}
-                        <span className="text-[#80868b] ml-2">(loss {result.optimization_report.beam_loss.toFixed(1)})</span>
-                      </td>
-                    </tr>
-                  )}
-                  <tr>
-                    <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">Chosen score</td>
+                    <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">GC range ({result.gc_window_size}bp window)</td>
                     <td className="py-0.5">
-                      {result.optimization_report.chosen_score.toFixed(1)}
+                      {(result.gc_window_min * 100).toFixed(1)}% – {(result.gc_window_max * 100).toFixed(1)}%
                       <span className="text-[#80868b] ml-2">
-                        ({result.optimization_report.ideal_score > 0
-                          ? `${(100 * result.optimization_report.chosen_score / result.optimization_report.ideal_score).toFixed(1)}% of ideal, `
-                          : ""}
-                        {result.optimization_report.source === "beam" ? "beam" :
-                         result.optimization_report.source === "dna_chisel_fallback" ? "DNA Chisel fallback" :
-                         result.optimization_report.source === "beam_pruned_empty" ? "beam failed (constraints too tight) — using DNA Chisel" :
-                         result.optimization_report.source === "beam_no_solution" ? "beam found no solution — using DNA Chisel" :
-                         result.optimization_report.source}
-                        {result.optimization_report.source === "beam" && result.optimization_report.beam_k != null && ` K=${result.optimization_report.beam_k}`})
+                        (allowed {(gcMin).toFixed(0)}–{(gcMax).toFixed(0)}%)
                       </span>
                     </td>
                   </tr>
-                  <tr>
-                    <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">Codons adjusted by optimizer</td>
-                    <td className="py-0.5">{result.optimization_report.codons_changed} of {result.length_protein}</td>
-                  </tr>
-                  {result.optimization_report.min_frequency_achieved != null && (
+                )}
+                <tr>
+                  <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">All constraints pass</td>
+                  <td className="py-0.5">
+                    {(() => {
+                      const pass = editedConstraints?.constraints_pass ?? result.constraints_pass;
+                      return (
+                        <span className={pass ? "text-[#188038]" : "text-[#d93025]"}>
+                          {pass ? "Yes" : "No"}
+                        </span>
+                      );
+                    })()}
+                  </td>
+                </tr>
+                <tr>
+                  <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">Translation matches input</td>
+                  <td className="py-0.5">
+                    <span className={
+                      result.input_protein === result.back_translated_protein.replace(/\*$/, "")
+                        ? "text-[#188038]"
+                        : "text-[#d93025]"
+                    }>
+                      {result.input_protein === result.back_translated_protein.replace(/\*$/, "")
+                        ? "Yes"
+                        : "No"}
+                    </span>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+
+            {result.optimization_report && result.optimization_report.ideal_score != null && (
+              <>
+                <h3 className="text-sm font-medium text-[#5f6368] uppercase tracking-wide mb-2">Optimization</h3>
+                <table className="text-sm">
+                  <tbody>
                     <tr>
-                      <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">Min codon frequency in output</td>
+                      <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">Ideal score (all best codons)</td>
+                      <td className="py-0.5">{result.optimization_report.ideal_score.toFixed(1)}</td>
+                    </tr>
+                    <tr>
+                      <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">Beam search score</td>
                       <td className="py-0.5">
-                        {result.optimization_report.min_frequency_achieved.toFixed(1)}/1000
+                        {result.optimization_report.chosen_score.toFixed(1)}
                         <span className="text-[#80868b] ml-2">
-                          (requested floor {minCodonFrequency}/1000)
+                          (loss {result.optimization_report.total_loss.toFixed(1)}
+                          {result.optimization_report.ideal_score > 0
+                            ? `, ${(100 * result.optimization_report.chosen_score / result.optimization_report.ideal_score).toFixed(1)}% of ideal`
+                            : ""}
+                          {result.optimization_report.beam_k != null ? `, K=${result.optimization_report.beam_k}` : ""})
                         </span>
                       </td>
                     </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-          )}
+                    {result.optimization_report.min_frequency_achieved != null && (
+                      <tr>
+                        <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">Min codon frequency in output</td>
+                        <td className="py-0.5">
+                          {result.optimization_report.min_frequency_achieved.toFixed(1)}/1000
+                          <span className="text-[#80868b] ml-2">
+                            (requested floor {minCodonFrequency}/1000)
+                          </span>
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </>
+            )}
+          </div>
 
           {/* Interactive codon track */}
           <CodonTrackViewer

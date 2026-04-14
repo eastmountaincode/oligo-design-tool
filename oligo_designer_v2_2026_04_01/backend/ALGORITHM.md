@@ -206,22 +206,26 @@ design decisions. Most can only be fixed by codon optimization upstream.
 
 ---
 
-# Codon Optimization (DNA Chisel)
+# Codon Optimization
 
-Upstream of oligo tiling, the tool can optimize a protein sequence into
-codon-optimized DNA. This uses DNA Chisel (open-source Python library) as
-a constraint solver.
+Upstream of oligo tiling, the tool optimizes a protein sequence into
+codon-optimized DNA using a custom beam search. DNA Chisel (open-source
+Python library) is still used for constraint *evaluation* and k-mer
+detection, but no longer runs as an optimizer.
 
 ## Pipeline
 
 1. User provides a protein sequence and selects a codon table
-2. DNA Chisel reverse-translates, then optimizes codon choices subject to
-   constraints (homopolymers, GC content) and objectives (codon frequency)
-3. The optimized DNA is displayed in an interactive codon track for manual
+2. The protein is naively reverse-translated (top codon per amino acid,
+   ignoring constraints) to seed the beam
+3. Beam search re-examines every position over the full synonymous space,
+   enforcing GC windows, homopolymers, avoid patterns, and min codon
+   frequency as hard constraints during the search
+4. The optimized DNA is displayed in an interactive codon track for manual
    review and editing
-4. User can swap individual codons; each swap triggers a live constraint
+5. User can swap individual codons; each swap triggers a live constraint
    re-check
-5. When satisfied, user sends the DNA to the oligo tiling tab
+6. When satisfied, user sends the DNA to the oligo tiling tab
 
 ## Codon tables
 
@@ -236,24 +240,26 @@ The tool supports:
 
 ## Constraints (enforced during optimization)
 
-These are hard constraints — DNA Chisel will not produce a sequence that
-violates them.
+These are hard constraints — the beam will prune any candidate path that
+violates them before it ever reaches the final solution.
 
 | Constraint | Default | Why |
 |------------|---------|-----|
-| EnforceTranslation | Always on | The DNA must encode the input protein |
-| AvoidPattern (homopolymers) | 5+ consecutive same base | Homopolymer runs cause polymerase slippage during synthesis and assembly. Runs of 4 are borderline (only 4x G is genuinely concerning at length 4, covered by G-quad check). Default threshold is 5. |
-| EnforceGCContent | 25-75% in 50bp windows | Extreme GC causes problems: too high → secondary structures stall polymerase; too low → weak base pairing, poor annealing |
+| Amino acid preservation | Always on | Every candidate at position `i` is by construction a synonymous codon for `aa[i]` |
+| Homopolymers | 5+ consecutive same base | Homopolymer runs cause polymerase slippage during synthesis and assembly. Runs of 4 are borderline (only 4x G is genuinely concerning at length 4, covered by G-quad check). Default threshold is 5. |
+| GC content | 25-75% in 50bp windows | Extreme GC causes problems: too high → secondary structures stall polymerase; too low → weak base pairing, poor annealing |
+| Min codon frequency | User-set (default 10/1000) | Filters out very rare codons that could stall translation |
+| Avoid patterns | User-supplied regex list | Restriction sites, recognition sequences, etc. |
 
 ## K-mer uniqueness: warning only, NOT a constraint
 
 **Decision:** Repeated 10-mers (UniquifyAllKmers) are detected and shown as
 warnings but are NOT enforced during optimization.
 
-**Why:** Enforcing k-mer uniqueness forces DNA Chisel to swap away from the
-best codon to break a repeat. This directly conflicts with the primary goal
-of choosing optimal codons for expression. The tradeoff is not worth it
-because:
+**Why:** Enforcing k-mer uniqueness forces the optimizer to swap away from
+the best codon to break a repeat. This directly conflicts with the primary
+goal of choosing optimal codons for expression. The tradeoff is not worth
+it because:
 
 1. Repeated k-mers are only a real problem if both copies land in overlap
    regions during oligo tiling, where they could cause mis-annealing
@@ -270,60 +276,71 @@ can make an informed judgment call.
 |-----------|-------------|
 | CodonOptimize | Maximize usage of high-frequency codons from the selected table |
 
-## Two-stage optimization: DNA Chisel + beam search refinement
+## Beam search (`gc_refinement.py`)
 
-The pipeline runs two optimizers in sequence and keeps whichever produces lower
-total loss.
+The optimizer is a custom beam search over synonymous codons. Each
+candidate at position `i` is a codon encoding `aa[i]` whose frequency is
+above `min_codon_frequency` (or the single best available codon if nothing
+clears the floor at that position).
 
-**Stage 1 — DNA Chisel.** Reverse-translates the protein and resolves
-constraints via local backtracking search. It treats codon frequency as a
-soft objective. Its weakness is that it processes constraint breaches
-left-to-right and commits to early codon choices, sometimes hammering a
-single codon with a large frequency sacrifice when it could have spread a
-smaller cost across several positions.
+The beam walks the protein left to right. At each position, every live
+path is extended by every candidate codon, and extensions are checked
+against hard constraints on the last few bases of the tail: sliding GC
+windows must fall inside `[gc_min, gc_max]`, no G/C run can reach
+`homo_gc`, no A/T run can reach `homo_at`, and no avoid-pattern may match.
+Extensions that fail are dropped immediately.
 
-**Stage 2 — Beam search refinement** (`gc_refinement.py`). Re-optimizes
-*from scratch*, considering every synonymous codon at every position. At each
-codon position, candidate paths are extended one codon at a time and pruned
-against the same hard constraints (GC window, homopolymers, avoid patterns,
-min codon frequency). Paths are bucketed by `(window_gc_count,
-last_codon_gc_count)` to maintain spatial diversity, and the top `BEAM_K`
-paths per bucket survive.
+Surviving extensions are bucketed by `(window_gc_count,
+last_codon_gc_count)` — an equivalence class on the state the future
+depends on — and the top `BEAM_K` paths per bucket survive by loss. Loss
+is the cumulative `(best_score_at_position - chosen_score)`. After the
+last position, we reconstruct the lowest-loss path by walking parent
+pointers back to the root.
 
 **Why beam, not exact DP.** Exact DP would require a state of `(position,
-last ~50 bases)` to check sliding-window GC. That's ~2^47 distinct states per
-position — infeasible. Beam search is the practical approximation: the
-buckets are a lossy form of state equivalence, and `BEAM_K` controls how many
-representatives per equivalence class survive.
+last ~50 bases)` to check sliding-window GC. That's ~2^47 distinct states
+per position — infeasible. Beam search is the practical approximation: the
+buckets are a lossy form of state equivalence, and `BEAM_K` controls how
+many representatives per equivalence class survive.
 
-**Why both stages, not just beam.** DNA Chisel acts as a feasibility safety
-net: if the beam prunes itself into a corner, we still have DNA Chisel's
-output to fall back on. The final output picks whichever has lower loss; the
-optimization report reports `source: "beam"` or `source:
-"dna_chisel_fallback"` so this is observable.
+**Why not DNA Chisel.** The pipeline previously ran DNA Chisel first and
+used its output as a fallback when the beam pruned empty. We removed
+Chisel because: (1) the beam ignores Chisel's codon choices anyway — it
+only reads the amino acid sequence and re-searches from scratch; (2) on
+tight-GC problems Chisel errors out entirely, so we never reached the beam
+in exactly the cases where the beam matters most; (3) when the beam did
+fall back to Chisel's output, that output nearly always violated the
+min-codon-frequency floor too, producing confusing per-codon warnings; (4)
+the K sweep showed the beam consistently ~3x better than Chisel on total
+loss. Starting from a naive top-codon reverse translation and running only
+the beam is simpler, faster, and no less robust.
+
+**If the beam prunes empty.** We return the naive reverse translation with
+`source: "beam_pruned_empty"` and surface a "no solution found" banner in
+the optimization report telling the user which constraints to relax.
 
 **Empirical loss/runtime tradeoff** (test_beam_k_sweep.py, 230 aa protein,
 GC 40-60%):
 
-| K | time | beam loss | chisel loss |
-|---|------|-----------|-------------|
-| 5 | 0.6s | 1900 | 5020 |
-| 15 | 0.4s | 1840 | 5420 |
-| 30 | 0.7s | 1790 | 6020 |
-| 60 | 1.5s | 1790 | 5380 |
-| 120 | 3.0s | 1800 | 5760 |
-| 250 | 6.3s | 1800 | 5660 |
+| K | time | loss |
+|---|------|------|
+| 5 | 0.6s | 1900 |
+| 15 | 0.4s | 1840 |
+| 30 | 0.7s | 1790 |
+| 60 | 1.5s | 1790 |
+| 120 | 3.0s | 1800 |
+| 250 | 6.3s | 1800 |
 
-Beam consistently beats DNA Chisel by ~3000 loss points. Quality saturates
-around K=30; raising K further does not help on this test case. Default
-`BEAM_K=15` is exposed as a user parameter (`beam_k` in the API).
+Quality saturates around K=30; raising K further does not help on this
+test case. Default `BEAM_K=15` is exposed as a user parameter (`beam_k` in
+the API).
 
 ## Progress streaming
 
 `POST /api/codon-optimize-stream` returns Server-Sent Events with progress
-ticks (`{type: "progress", stage: "dna_chisel"|"beam", current, total}`)
-and a final `{type: "result", data: ...}` event. The frontend consumes this
-to show a progress bar during long beam runs.
+ticks (`{type: "progress", stage: "beam", current, total}`) and a final
+`{type: "result", data: ...}` event. The frontend consumes this to show a
+progress bar during long beam runs.
 
 ## Codon coloring in the track viewer
 

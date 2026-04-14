@@ -75,6 +75,7 @@ const WARNING_COLORS: Record<string, string> = {
   homopolymer: "#d93025",
   gc_window: "#0097a7",
   repeat_kmer: "#7b1fa2",
+  low_codon_frequency: "#e37400",
 };
 
 export default function CodonTrackViewer({ codons, codonTable, warnings, originalWarnings, onDnaChange, onUndo, canUndo }: Props) {
@@ -269,6 +270,9 @@ export default function CodonTrackViewer({ codons, codonTable, warnings, origina
         <div style={{ width: LEFT_MARGIN, flexShrink: 0 }}>
           <svg width={LEFT_MARGIN} height={totalH} className="select-none">
             <text x={4} y={RULER_H - 4} fontSize={9} fill="#5f6368">nt</text>
+            {warningTrackH > 0 && (
+              <text x={4} y={RULER_H + warningTrackH / 2 + 3} fontSize={9} fill="#5f6368">Issues</text>
+            )}
             <text x={4} y={contentStartY + AA_ROW_H - 3} fontSize={9} fill="#5f6368">AA</text>
             <text x={4} y={contentStartY + AA_ROW_H + ROW_GAP + CODON_ROW_H - 3} fontSize={9} fill="#5f6368">Codon</text>
             <text x={4} y={contentStartY + AA_ROW_H + ROW_GAP + CODON_ROW_H + ROW_GAP + VALUE_ROW_H - 3} fontSize={9} fill="#5f6368">/1000</text>
@@ -474,21 +478,25 @@ export default function CodonTrackViewer({ codons, codonTable, warnings, origina
       })()}
 
       {/* Legend */}
-      <div className="flex items-center gap-4 mt-3 text-xs text-[#5f6368]">
-        <div className="flex items-center gap-1">
-          <span className="inline-block w-3 h-3" style={{ backgroundColor: "#e6f4ea" }} />
-          Most frequent codon
-        </div>
-        <div className="flex items-center gap-1">
-          <span className="inline-block w-3 h-3" style={{ backgroundColor: "#fef7e0" }} />
-          Intermediate
-        </div>
-        <div className="flex items-center gap-1">
-          <span className="inline-block w-3 h-3" style={{ backgroundColor: "#fce8e6" }} />
-          Least frequent codon
+      <div className="mt-3 text-xs text-[#5f6368] space-y-1">
+        <div className="flex items-center gap-4">
+          <span className="text-[#80868b] w-20 flex-shrink-0">Codon:</span>
+          <div className="flex items-center gap-1">
+            <span className="inline-block w-3 h-3" style={{ backgroundColor: "#e6f4ea" }} />
+            Most frequent
+          </div>
+          <div className="flex items-center gap-1">
+            <span className="inline-block w-3 h-3" style={{ backgroundColor: "#fef7e0" }} />
+            Intermediate
+          </div>
+          <div className="flex items-center gap-1">
+            <span className="inline-block w-3 h-3" style={{ backgroundColor: "#fce8e6" }} />
+            Least frequent
+          </div>
         </div>
         {warnings.length > 0 && (
-          <>
+          <div className="flex items-center gap-4 flex-wrap">
+            <span className="text-[#80868b] w-20 flex-shrink-0">Warnings:</span>
             <div className="flex items-center gap-1">
               <span className="inline-block w-3 h-3" style={{ backgroundColor: "#d93025" }} />
               Homopolymer run
@@ -501,7 +509,11 @@ export default function CodonTrackViewer({ codons, codonTable, warnings, origina
               <span className="inline-block w-3 h-3" style={{ backgroundColor: "#7b1fa2" }} />
               Repeated k-mer
             </div>
-          </>
+            <div className="flex items-center gap-1">
+              <span className="inline-block w-3 h-3" style={{ backgroundColor: "#e37400" }} />
+              Low codon frequency
+            </div>
+          </div>
         )}
       </div>
     </div>
