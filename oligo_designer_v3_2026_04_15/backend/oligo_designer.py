@@ -16,6 +16,7 @@ Overlaps (~20bp) between adjacent oligos are checked for:
   - G-quadruplex potential
 """
 
+import math
 import re
 import sys
 import argparse
@@ -291,6 +292,7 @@ def tile_sequence(
     plasmid_downstream: str = "",
     max_shift: int = 5,
     conditions: ReactionConditions | None = None,
+    start_strand: str = "sense",
 ) -> tuple[list[Oligo], list[Overlap]]:
     """
     Tile a DNA sequence into overlapping oligos.
@@ -334,13 +336,25 @@ def tile_sequence(
 
     step = max_oligo_length - overlap_length
 
-    # Generate cut points (positions where one oligo ends and the overlap begins)
-    # First oligo starts at position 0 of full_seq
-    cut_points = []
-    pos = max_oligo_length  # end of first oligo
-    while pos < len(full_seq):
-        cut_points.append(pos - overlap_length)  # start of overlap region
-        pos += step
+    # Generate INITIAL cut points. We pick the minimum number of oligos N
+    # such that N oligos, each capped at max_oligo_length and joined by
+    # overlap_length overlaps, can cover len(full_seq); then we place the
+    # N-1 cuts at evenly-spaced positions so every oligo is roughly the
+    # same length. Packing cuts from the left at a fixed step (the old
+    # behavior) worked when len(full_seq) was a clean multiple of step,
+    # but when it wasn't all the slack piled up on the LAST oligo — which
+    # in a split assembly is the one that has to carry both the intra-
+    # reaction overlap with the preceding antisense AND the junction
+    # handoff to the next reaction. Balanced placement avoids the short-
+    # last-oligo pathology without changing the overlap count for any
+    # input where the old behavior was already optimal.
+    if len(full_seq) <= max_oligo_length:
+        cut_points: list[int] = []
+    else:
+        n_oligos = max(2, math.ceil((len(full_seq) - overlap_length) / step))
+        balanced_len = (len(full_seq) + (n_oligos - 1) * overlap_length) / n_oligos
+        balanced_step = balanced_len - overlap_length
+        cut_points = [int(round((i + 1) * balanced_step)) for i in range(n_oligos - 1)]
 
     # Try to optimize each cut point for overlap quality.
     # Constraint: adjacent cuts must stay >= overlap_length apart so that
@@ -424,7 +438,14 @@ def tile_sequence(
         end = min(end, len(full_seq))
 
         oligo_seq = full_seq[start:end]
-        strand = "sense" if i % 2 == 0 else "antisense"
+        # `start_strand` controls the parity of the first oligo. Non-first
+        # reactions in a split assembly pass start_strand="antisense" so that
+        # the junction between rxn K's last oligo and rxn K+1's first oligo
+        # is a natural sense/antisense pair (and the Gibson 5' end chemistry
+        # at the junction matches the within-reaction overlaps).
+        first_is_sense = start_strand == "sense"
+        strand = ("sense" if i % 2 == 0 else "antisense") if first_is_sense \
+                 else ("antisense" if i % 2 == 0 else "sense")
 
         if strand == "antisense":
             oligo_seq = reverse_complement(oligo_seq)
@@ -495,6 +516,7 @@ def tile_sequence_with_gblocks(
     plasmid_downstream: str = "",
     max_shift: int = 5,
     conditions: ReactionConditions | None = None,
+    start_strand: str = "sense",
 ) -> tuple[list[Oligo], list[Overlap], list[GBlockFragment]]:
     """Tile a DNA sequence into oligos + gBlock fragments.
 
@@ -620,16 +642,18 @@ def tile_sequence_with_gblocks(
             n_oligos = max(1, n_oligos)
         n_region_cuts = n_oligos - 1
 
-        # Nominal cut positions: same tiling rule as tile_sequence, just
-        # anchored to the effective endpoints. The while-loop would
-        # over-count on short regions where we manually set n_region_cuts,
-        # so we just generate exactly n_region_cuts evenly-spaced cuts.
+        # Nominal cut positions — balanced spacing across the effective
+        # span, same rationale as tile_sequence(): distribute cuts evenly
+        # so the LAST oligo isn't the one that absorbs all the rounding
+        # slack (otherwise a reaction's last oligo can end up 20-25 bp,
+        # too short to carry both the intra-reaction and junction
+        # overlaps comfortably).
         cuts: list[int] = []
         if n_region_cuts > 0:
-            pos = rs_eff + max_oligo_length
-            for _ in range(n_region_cuts):
-                cuts.append(pos - overlap_length)
-                pos += step
+            balanced_len = (eff_span + n_region_cuts * overlap_length) / n_oligos
+            balanced_step = balanced_len - overlap_length
+            cuts = [int(round(rs_eff + (i + 1) * balanced_step))
+                    for i in range(n_region_cuts)]
 
         # Cut placement. Bounds enforce per-oligo length cap, properly
         # accounting for the gBlock extensions at region boundaries.
@@ -729,7 +753,10 @@ def tile_sequence_with_gblocks(
             ))
         else:
             frag_seq = full_seq[frag_start:frag_end]
-            strand = "sense" if oligo_idx % 2 == 0 else "antisense"
+            # See tile_sequence() for the rationale on `start_strand`.
+            first_is_sense = start_strand == "sense"
+            strand = ("sense" if oligo_idx % 2 == 0 else "antisense") if first_is_sense \
+                     else ("antisense" if oligo_idx % 2 == 0 else "sense")
             if strand == "antisense":
                 frag_seq = reverse_complement(frag_seq)
             oligos.append(Oligo(

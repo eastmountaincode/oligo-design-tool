@@ -23,6 +23,10 @@ export interface OverlapData {
   issues: { kind: string; message: string; severity: string; start?: number; end?: number }[];
   // See OligoData.rxnIndex.
   rxnIndex?: number;
+  // True when this is the Gibson handoff between this reaction and the NEXT
+  // one (shared last L bp / first L bp). Rendered with a distinct style so
+  // the user can spot where one reaction tube ends and the next begins.
+  is_junction?: boolean;
 }
 
 // Label oligos / overlaps as "<num><letter>" in multi-reaction mode, where
@@ -38,9 +42,13 @@ export function oligoLabel(oligo: Pick<OligoData, "index" | "rxnIndex">): string
   return `${oligo.index + 1}${rxnLetter(oligo.rxnIndex)}`;
 }
 
-export function overlapLabel(overlap: Pick<OverlapData, "index" | "rxnIndex">): string {
-  // Overlap index is already 1-based (from the backend), so don't +1.
-  return `${overlap.index}${rxnLetter(overlap.rxnIndex)}`;
+export function overlapLabel(overlap: Pick<OverlapData, "index">): string {
+  // Overlaps are numbered globally along the construct (1..N by position)
+  // regardless of which reaction they live in — a single unbroken sequence
+  // of overlap regions reads more naturally than "5A / 1B". The parent is
+  // responsible for rewriting `index` into that global numbering before
+  // handing overlaps to the viewer / tables.
+  return `${overlap.index}`;
 }
 
 export interface SequenceIssue {

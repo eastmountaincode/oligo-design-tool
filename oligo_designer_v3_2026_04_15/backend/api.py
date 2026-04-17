@@ -31,7 +31,7 @@ if CUSTOM_TABLES_DIR.exists():
         CUSTOM_TABLES[f.stem] = f.read_text()
 from oligo_designer import (
     tile_sequence, tile_sequence_with_gblocks, scan_sequence_complexity,
-    gc_content, ReactionConditions,
+    gc_content, ReactionConditions, Overlap, check_overlap,
 )
 
 app = FastAPI(title="Oligo Designer", version="1.0")
@@ -112,6 +112,11 @@ class OverlapOut(BaseModel):
     gc: float
     tm: float | None
     issues: list[dict]
+    # True iff this overlap is the Gibson handoff between this reaction and
+    # the NEXT reaction (i.e. between rxn K's last oligo and rxn K+1's first
+    # oligo, which the one-sided junction design tiles as a sense/antisense
+    # pair). Intra-reaction overlaps always have is_junction=False.
+    is_junction: bool = False
 
 
 class GBlockOut(BaseModel):
@@ -251,16 +256,31 @@ def design(req: DesignRequest):
 
     reactions: list[ReactionResult] = []
     all_overlap_tms: list[float] = []
+    # Strand of the previous reaction's last oligo. We flip the strand parity
+    # in the next reaction so that the junction pair (rxn K's last oligo +
+    # rxn K+1's first oligo) is always sense/antisense — the same layout as
+    # an intra-reaction overlap, which is what the Gibson exonuclease step
+    # expects (chews 5' ends, exposes complementary 3' overhangs).
+    prev_last_strand: str | None = None
+    thermo_global = conditions.make_thermo()
 
     for k in range(len(boundaries) - 1):
         seg_start = boundaries[k]
         seg_end = boundaries[k + 1]
         segment_dna = seq[seg_start:seg_end]
 
+        # Junction design: ONE-SIDED. Each non-first reaction pulls L bp of
+        # its predecessor's tail in as a left flank; no reaction ever extends
+        # rightward past its split. That way reaction K's last oligo ends
+        # cleanly at its split, and reaction K+1's first oligo reaches back
+        # by L bp to create the Gibson overlap that joins their assembled
+        # fragments. The earlier "both-sided" design added an unnecessary
+        # extra oligo per reaction at every junction (the classic "why is
+        # there a 7A past the split?" symptom).
         left_is_junction = k > 0
         right_is_junction = k < len(boundaries) - 2
         left_flank = seq[seg_start - L:seg_start] if left_is_junction else req.plasmid_upstream
-        right_flank = seq[seg_end:seg_end + L] if right_is_junction else req.plasmid_downstream
+        right_flank = "" if right_is_junction else req.plasmid_downstream
 
         # gBlocks fully contained in this segment, translated to segment-local insert coords.
         seg_gbs = []
@@ -274,24 +294,33 @@ def design(req: DesignRequest):
                     "label": g.get("label", ""),
                 })
 
+        # Flip strand parity on every junction so rxn K's last oligo and
+        # rxn K+1's first oligo land on opposite strands (see `prev_last_strand`
+        # comment above). Reaction 0 starts sense like it always has.
+        start_strand = "sense" if prev_last_strand is None \
+                       else ("antisense" if prev_last_strand == "sense" else "sense")
+
         # Initial tile of this segment.
         oligos, overlaps, gblock_frags = _tile_segment(
             segment_dna, seg_gbs, left_flank, right_flank, conditions, req,
+            start_strand=start_strand,
         )
 
         # Cross-hyb repair, per-reaction. The repair pass is FORBIDDEN from
-        # touching codons within `overlap_length` bp of any junction, because
-        # those bp are the shared junction DNA that also appears in the
-        # neighboring reaction's flank — modifying them would silently desync
-        # the two reactions. Plasmid-adjacent edges are repair-eligible
-        # normally (no neighbor to desync with).
+        # touching the LAST L bp of every non-final reaction's segment,
+        # because the NEXT reaction pulls those exact bp in as its left
+        # flank — if repair silently edits them here, the next reaction's
+        # first oligo would be designed against stale sequence and the
+        # junction Gibson overlap would mismatch.
+        #
+        # In the one-sided junction design the FIRST L bp of a non-first
+        # reaction don't need freezing: they exist only inside this reaction
+        # (the previous reaction stops at the split), so repair is free to
+        # swap synonymous codons there.
         repair_report = RepairReport(ran=False)
         if _has_cross_hyb(overlaps) and req.repair_context \
                 and req.repair_context.protein and req.repair_context.codon_table:
-            # Junction-frozen ranges in segment-local insert coords.
             frozen = list(seg_gbs)
-            if left_is_junction:
-                frozen.append({"start_bp": 0, "end_bp": L, "label": "__junction_left__"})
             if right_is_junction:
                 frozen.append({
                     "start_bp": len(segment_dna) - L,
@@ -315,6 +344,7 @@ def design(req: DesignRequest):
                 segment_dna = repair_report.modified_dna
                 oligos, overlaps, gblock_frags = _tile_segment(
                     segment_dna, seg_gbs, left_flank, right_flank, conditions, req,
+                    start_strand=start_strand,
                 )
 
         # Translate positions from reaction-local full_seq coords into the
@@ -351,6 +381,45 @@ def design(req: DesignRequest):
             )
             for i, ovl in enumerate(overlaps)
         ]
+
+        # Synthesize the JUNCTION overlap between this reaction's last oligo
+        # and the next reaction's first oligo. In the one-sided junction
+        # design, that's the last L bp of this reaction's segment (sense in
+        # this reaction, antisense in the next reaction). We expose it as a
+        # regular OverlapOut flagged with is_junction=True so the frontend
+        # can number it in the global overlap sequence and render it in the
+        # overlap table + viewer between the two reactions' oligos.
+        if right_is_junction:
+            j_start_insert = seg_end - L
+            j_end_insert = seg_end
+            j_seq = seq[j_start_insert:j_end_insert]
+            # Use full-construct global coords so check_overlap's position
+            # messages point at the right nucleotide in the assembled frame.
+            j_global_start = construct_offset + j_start_insert
+            j_global_end = construct_offset + j_end_insert
+            j_ovl_for_scan = Overlap(
+                seq=j_seq, start=j_global_start, end=j_global_end,
+            )
+            j_issues = check_overlap(
+                j_ovl_for_scan,
+                req.plasmid_upstream + seq + req.plasmid_downstream,
+            )
+            try:
+                j_tm = thermo_global.calc_tm(j_seq)
+            except Exception:
+                j_tm = None
+            final_overlaps.append(OverlapOut(
+                index=len(final_overlaps) + 1,
+                seq=j_seq,
+                start=j_global_start, end=j_global_end,
+                gc=round(gc_content(j_seq), 3),
+                tm=round(j_tm, 1) if j_tm is not None else None,
+                issues=[{"kind": iss.kind, "message": iss.message,
+                         "severity": iss.severity,
+                         "start": iss.start, "end": iss.end}
+                        for iss in j_issues],
+                is_junction=True,
+            ))
         final_gblocks = [
             GBlockOut(
                 index=gf.index, seq=gf.seq,
@@ -360,6 +429,10 @@ def design(req: DesignRequest):
             )
             for gf in gblock_frags
         ]
+
+        # Remember this reaction's last-oligo strand so the next reaction
+        # can flip its parity at the junction.
+        prev_last_strand = final_oligos[-1].strand if final_oligos else prev_last_strand
 
         rxn_tms = [ovl.tm for ovl in final_overlaps if ovl.tm is not None]
         all_overlap_tms.extend(rxn_tms)
@@ -414,12 +487,19 @@ def _tile_segment(
     right_flank: str,
     conditions: ReactionConditions,
     req: DesignRequest,
+    start_strand: str = "sense",
 ):
     """Tile one reaction's segment with the supplied flanks.
 
     Returns (oligos, overlaps, gblock_frags) in REACTION-LOCAL full_seq
     coordinates (i.e. positions relative to `left_flank + segment_dna +
     right_flank`). Callers translate these to the global construct frame.
+
+    `start_strand` controls whether this reaction's first oligo is sense or
+    antisense. Non-first reactions in a multi-reaction assembly pass
+    "antisense" so the junction with the previous reaction is a proper
+    sense/antisense pair (the 5' ends line up the way Gibson exonuclease
+    expects).
     """
     if not seg_gbs:
         oligos_, overlaps_ = tile_sequence(
@@ -428,6 +508,7 @@ def _tile_segment(
             plasmid_upstream=left_flank,
             plasmid_downstream=right_flank,
             conditions=conditions,
+            start_strand=start_strand,
         )
         return oligos_, overlaps_, []
     gb_tuples = [(g.get("start_bp", 0), g.get("end_bp", 0), g.get("label", ""))
@@ -440,6 +521,7 @@ def _tile_segment(
         plasmid_upstream=left_flank,
         plasmid_downstream=right_flank,
         conditions=conditions,
+        start_strand=start_strand,
     )
     return oligos_, overlaps_, gblock_frags_
 

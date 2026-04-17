@@ -330,8 +330,17 @@ export default function OligoViewer({
     if (!svg) return;
 
     function bpFromClientX(clientX: number): number {
+      // The SVG lives inside a horizontally-scrollable container. Its
+      // getBoundingClientRect() already shifts with the scroll (rect.left
+      // is the SVG's CURRENT viewport position, offset by -scrollLeft when
+      // scrolled right), so `clientX - rect.left` is already the cursor's
+      // x-coordinate in SVG-local space. Adding scrollLeft on top was the
+      // old bug — it double-counted the scroll and made the drag handle
+      // jump to the right by `scrollLeft / pxPerBp` bp on the first
+      // mousemove whenever the construct was zoomed past the container
+      // width.
       const rect = (svg as SVGSVGElement).getBoundingClientRect();
-      const localX = clientX - rect.left + (scrollRef.current?.scrollLeft ?? 0);
+      const localX = clientX - rect.left;
       const globalBp = Math.max(0, Math.min(totalLength, localX / pxPerBp));
       return globalBp - insertStart;
     }

@@ -3,7 +3,7 @@
 import { Fragment, useState, useEffect, useRef, useCallback } from "react";
 import OligoViewer from "./OligoViewer";
 import { ISSUE_COLORS } from "./viewer/colors";
-import { oligoLabel, overlapLabel } from "./viewer/types";
+import { oligoLabel } from "./viewer/types";
 import type { RepairContext, RepairReport } from "./types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -181,6 +181,15 @@ export default function OligoDesignerPage({
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Monotonic request id. When the user drags a split (or rapidly changes N)
+  // we fire multiple `/api/design` requests in quick succession. The network
+  // doesn't guarantee FIFO ordering, so a slower earlier response can arrive
+  // AFTER a faster later one and clobber it — that stale result showed up
+  // visually as "extra rows of oligos" at the junction because the overlap
+  // region's oligos snapped back to the previous split position while the
+  // viewer was already rendering the new one. We track the latest request
+  // id and drop any response whose id is older.
+  const designReqIdRef = useRef(0);
 
   // Ref-mirror of splits so `runDesign` can read the current splits without
   // itself depending on the `splits` state. If `runDesign` took `splits` as
@@ -193,6 +202,7 @@ export default function OligoDesignerPage({
 
   const runDesign = useCallback(async (seq: string, overrideSplits?: number[]) => {
     if (!seq.trim()) return;
+    const reqId = ++designReqIdRef.current;
     setError("");
     setLoading(true);
     try {
@@ -219,11 +229,18 @@ export default function OligoDesignerPage({
         const data = await res.json();
         throw new Error(data.detail || "Design failed");
       }
-      setResult(await res.json());
+      const payload = await res.json();
+      if (reqId === designReqIdRef.current) {
+        setResult(payload);
+      }
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Unknown error");
+      if (reqId === designReqIdRef.current) {
+        setError(err instanceof Error ? err.message : "Unknown error");
+      }
     } finally {
-      setLoading(false);
+      if (reqId === designReqIdRef.current) {
+        setLoading(false);
+      }
     }
   }, [maxOligoLength, overlapLength, upstream, downstream, mvConc, dvConc, dntpConc, dnaConc, annealingTemp, liveGblocks, repairContext]);
 
@@ -318,7 +335,7 @@ export default function OligoDesignerPage({
           />
         </div>
 
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div className="grid grid-cols-3 gap-4">
           <div>
             <label className="block text-sm font-medium mb-1 text-[#202124]">
               Max oligo length (bp)
@@ -348,7 +365,6 @@ export default function OligoDesignerPage({
           <div>
             <label className="block text-sm font-medium mb-1 text-[#202124]">
               Split into N reactions
-              <span className="ml-1 text-xs text-[#9aa0a6] font-normal">(1 = don&apos;t split)</span>
             </label>
             <input
               type="number"
@@ -492,7 +508,23 @@ export default function OligoDesignerPage({
         // can show R1/R2/... badges.
         const reactions = result.reactions ?? [];
         const flatOligos = reactions.flatMap((r) => r.oligos.map((o) => ({ ...o, rxnIndex: r.index })));
-        const flatOverlaps = reactions.flatMap((r) => r.overlaps.map((o) => ({ ...o, rxnIndex: r.index })));
+        // Renumber overlaps globally 1..N by genomic position so labels read
+        // as an unbroken sequence along the construct (requested behavior:
+        // letters only make sense for oligos, which are reaction-local).
+        // Keep `rxnIndex` alongside for React keys and selection identity,
+        // but overwrite `index` with the global number.
+        const flatOverlaps = reactions
+          .flatMap((r) =>
+            r.overlaps.map((o) => ({ ...o, rxnIndex: r.index, origIndex: o.index }))
+          )
+          .sort((a, b) => a.start - b.start)
+          .map((o, i) => ({ ...o, index: i + 1 }));
+        // Map from (rxnIndex, originalIndex) → global index so per-reaction
+        // table rows can show the same number the viewer uses.
+        const overlapGlobalByKey = new Map<string, number>();
+        for (const o of flatOverlaps) {
+          overlapGlobalByKey.set(`${o.rxnIndex}-${o.origIndex}`, o.index);
+        }
         const flatGblocks = reactions.flatMap((r) => r.gblocks.map((g) => ({ ...g, rxnIndex: r.index })));
         const multiReaction = reactions.length > 1;
         const rxnBadge = (idx: number) => `R${idx + 1}`;
@@ -708,7 +740,9 @@ export default function OligoDesignerPage({
                             <span className="ml-2 text-[#9aa0a6] normal-case tracking-normal font-normal">
                               insert {r.insert_start + 1}–{r.insert_end}
                               {" · "}
-                              {r.left_is_junction ? "junction" : "plasmid"} 5&prime; flank / {r.right_is_junction ? "junction" : "plasmid"} 3&prime; flank
+                              {r.left_is_junction ? `overlaps rxn ${r.index} (${r.left_flank.length} bp)` : `plasmid 5\u2032 flank (${r.left_flank.length} bp)`}
+                              {" / "}
+                              {r.right_is_junction ? `handoff to rxn ${r.index + 2}` : `plasmid 3\u2032 flank (${r.right_flank.length} bp)`}
                             </span>
                           </td>
                         </tr>
@@ -823,7 +857,15 @@ export default function OligoDesignerPage({
                         }`}
                       >
                         <td className="px-4 py-2">
-                          {overlapLabel({ index: o.index, rxnIndex: multiReaction ? r.index : undefined })}
+                          {overlapGlobalByKey.get(`${r.index}-${o.index}`) ?? o.index}
+                          {o.is_junction && (
+                            <span
+                              className="ml-2 inline-block rounded-sm bg-[#e8f0fe] text-[#1967d2] text-[10px] font-medium uppercase tracking-wide px-1.5 py-0.5 align-middle"
+                              title={`Junction handoff between reaction ${r.index + 1} and reaction ${r.index + 2}`}
+                            >
+                              junction → R{r.index + 2}
+                            </span>
+                          )}
                         </td>
                         <td className="px-4 py-2 text-[#5f6368]">
                           {o.start + 1}-{o.end}
