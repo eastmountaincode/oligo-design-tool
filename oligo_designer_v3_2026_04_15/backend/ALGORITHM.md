@@ -39,10 +39,10 @@ intervals. A cut point is where one oligo's unique region ends and the overlap
 with the next oligo begins.
 
 ```
-step = oligo_length - overlap_length
+step = max_oligo_length - overlap_length
 ```
 
-With defaults (oligo_length=45, overlap_length=20), step = 25bp. So a cut
+With defaults (max_oligo_length=45, overlap_length=20), step = 25bp. So a cut
 point is placed every 25bp along the construct.
 
 Each oligo then spans from one cut point to the next, PLUS the overlap region.
@@ -200,7 +200,7 @@ design decisions. Most can only be fixed by codon optimization upstream.
 
 | Parameter | Default | Range | Notes |
 |-----------|---------|-------|-------|
-| oligo_length | 45 bp | 30-200 | Standard cheap IDT oligos are up to 45bp. 60bp and 200-mer cost more. |
+| max_oligo_length | 45 bp | 30-200 | Standard cheap IDT oligos are up to 45bp. 60bp and 200-mer cost more. |
 | overlap_length | 20 bp | 15-40 | ~20bp is standard for overlap assembly. |
 | max_shift | 5 bp | — | How far cut points can be shifted to optimize overlap quality. |
 

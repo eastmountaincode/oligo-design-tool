@@ -233,7 +233,7 @@ def codon_optimize_with_gblocks(
 def design_oligos_with_gblocks(
     dna: str,
     gblock_regions: list[GBlockRegion],
-    oligo_length: int = 45,
+    max_oligo_length: int = 45,
     overlap_length: int = 20,
 ) -> list[dict]:
     """Design oligos + gBlock fragments with proper boundary overlaps.
@@ -289,12 +289,12 @@ def design_oligos_with_gblocks(
             if len(region_dna) == 0:
                 continue
             # Simple tiling (no shift optimization — just demonstrate the concept)
-            step = oligo_length - overlap_length
+            step = max_oligo_length - overlap_length
             oligos = []
             pos = 0
             idx = 0
             while pos < len(region_dna):
-                olig_end = min(pos + oligo_length, len(region_dna))
+                olig_end = min(pos + max_oligo_length, len(region_dna))
                 olig_seq = region_dna[pos:olig_end]
                 strand = "sense" if idx % 2 == 0 else "antisense"
                 oligos.append({
@@ -329,7 +329,7 @@ def run_pipeline(
     raw_table: dict,
     gblock_regions: list[GBlockRegion],
     oligo_constraints: dict | None = None,
-    oligo_length: int = 45,
+    max_oligo_length: int = 45,
     overlap_length: int = 20,
 ) -> PipelineResult:
     if oligo_constraints is None:
@@ -360,7 +360,7 @@ def run_pipeline(
 
     # Step 2: design oligos + gBlock fragments
     segments = design_oligos_with_gblocks(
-        dna, gblock_regions, oligo_length, overlap_length
+        dna, gblock_regions, max_oligo_length, overlap_length
     )
 
     return PipelineResult(

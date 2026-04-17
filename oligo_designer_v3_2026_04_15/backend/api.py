@@ -50,7 +50,7 @@ app.add_middleware(
 
 class DesignRequest(BaseModel):
     sequence: str = Field(..., description="DNA sequence (ATCGs only)")
-    oligo_length: int = Field(60, ge=30, le=200)
+    max_oligo_length: int = Field(60, ge=30, le=200)
     overlap_length: int = Field(20, ge=15, le=40)
     plasmid_upstream: str = Field("", description="~20bp upstream flank for vector insertion")
     plasmid_downstream: str = Field("", description="~20bp downstream flank for vector insertion")
@@ -128,12 +128,12 @@ def design(req: DesignRequest):
 
     if not gbs:
         oligos, overlaps = tile_sequence(
-            seq, oligo_length=req.oligo_length, overlap_length=req.overlap_length,
+            seq, max_oligo_length=req.max_oligo_length, overlap_length=req.overlap_length,
             plasmid_upstream=req.plasmid_upstream, plasmid_downstream=req.plasmid_downstream,
             conditions=conditions,
         )
         report = design_oligos(
-            seq, oligo_length=req.oligo_length, overlap_length=req.overlap_length,
+            seq, max_oligo_length=req.max_oligo_length, overlap_length=req.overlap_length,
             plasmid_upstream=req.plasmid_upstream, plasmid_downstream=req.plasmid_downstream,
             conditions=conditions,
         )
@@ -144,7 +144,7 @@ def design(req: DesignRequest):
         oligos, overlaps, gblock_frags = tile_sequence_with_gblocks(
             seq,
             gblock_regions=gb_tuples,
-            oligo_length=req.oligo_length,
+            max_oligo_length=req.max_oligo_length,
             overlap_length=req.overlap_length,
             plasmid_upstream=req.plasmid_upstream,
             plasmid_downstream=req.plasmid_downstream,
@@ -152,7 +152,12 @@ def design(req: DesignRequest):
         )
         report = f"Designed {len(oligos)} oligos + {len(gblock_frags)} gBlock(s)"
 
-    seq_issues = scan_sequence_complexity(seq)
+    # Scan the FULL construct (upstream flank + insert + downstream flank) so
+    # issue coordinates match the full_seq coordinate system used by oligos,
+    # overlaps, and gBlocks. Scanning only `seq` would leave issue positions
+    # offset by `len(plasmid_upstream)` relative to what the frontend renders.
+    full_seq_for_scan = req.plasmid_upstream + seq + req.plasmid_downstream
+    seq_issues = scan_sequence_complexity(full_seq_for_scan)
 
     final_oligos = [
         OligoOut(

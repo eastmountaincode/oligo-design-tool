@@ -73,7 +73,7 @@ interface OligoDesignerPageProps {
 
 export default function OligoDesignerPage({ liveDna, liveGblocks }: OligoDesignerPageProps) {
   const [sequence, setSequence] = useState("");
-  const [oligoLength, setOligoLength] = useState(60);
+  const [maxOligoLength, setMaxOligoLength] = useState(60);
   const [overlapLength, setOverlapLength] = useState(20);
   const [upstream, setUpstream] = useState("");
   const [downstream, setDownstream] = useState("");
@@ -98,7 +98,7 @@ export default function OligoDesignerPage({ liveDna, liveGblocks }: OligoDesigne
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           sequence: seq,
-          oligo_length: oligoLength,
+          max_oligo_length: maxOligoLength,
           overlap_length: overlapLength,
           plasmid_upstream: upstream,
           plasmid_downstream: downstream,
@@ -120,7 +120,7 @@ export default function OligoDesignerPage({ liveDna, liveGblocks }: OligoDesigne
     } finally {
       setLoading(false);
     }
-  }, [oligoLength, overlapLength, upstream, downstream, mvConc, dvConc, dntpConc, dnaConc, annealingTemp, liveGblocks]);
+  }, [maxOligoLength, overlapLength, upstream, downstream, mvConc, dvConc, dntpConc, dnaConc, annealingTemp, liveGblocks]);
 
   // Auto-run design when liveDna or liveGblocks change (debounced)
   useEffect(() => {
@@ -164,12 +164,12 @@ export default function OligoDesignerPage({ liveDna, liveGblocks }: OligoDesigne
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
           <div>
             <label className="block text-sm font-medium mb-1 text-[#202124]">
-              Oligo length (bp)
+              Max oligo length (bp)
             </label>
             <input
               type="number"
-              value={oligoLength}
-              onChange={(e) => setOligoLength(Number(e.target.value))}
+              value={maxOligoLength}
+              onChange={(e) => setMaxOligoLength(Number(e.target.value))}
               min={30}
               max={200}
               className="w-full bg-white border border-[#dadce0] p-2 text-sm text-[#202124] focus:border-[#1a73e8] focus:outline-none"

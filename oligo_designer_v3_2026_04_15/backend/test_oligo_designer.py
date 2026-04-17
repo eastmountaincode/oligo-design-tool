@@ -190,12 +190,12 @@ def test_cross_hybridization():
     print(f"  PASS: cross_hybridization ({len(cross_issues)} issues found)")
 
 
-def test_different_oligo_lengths():
+def test_different_max_oligo_lengths():
     """Test with 60bp oligos (the longer IDT option)."""
-    oligos, overlaps = tile_sequence(TEST_SEQ_500, oligo_length=60, overlap_length=20)
+    oligos, overlaps = tile_sequence(TEST_SEQ_500, max_oligo_length=60, overlap_length=20)
     assembled = assemble_in_silico(oligos, TEST_SEQ_500)
     assert assembled == TEST_SEQ_500
-    # HARD MAX: no oligo may exceed the user-specified oligo_length. This is
+    # HARD MAX: no oligo may exceed the user-specified max_oligo_length. This is
     # an IDT pricing-tier constraint — going over bumps the order to a more
     # expensive bracket.
     over = [o for o in oligos if o.length > 60]
@@ -204,25 +204,25 @@ def test_different_oligo_lengths():
         f"{[(o.index, o.length) for o in over]}; cap = 60"
     )
     # Should need fewer oligos with longer oligos
-    oligos_short, _ = tile_sequence(TEST_SEQ_500, oligo_length=45, overlap_length=20)
+    oligos_short, _ = tile_sequence(TEST_SEQ_500, max_oligo_length=45, overlap_length=20)
     assert all(o.length <= 45 for o in oligos_short), "45bp cap should hold"
     assert len(oligos) < len(oligos_short), "60bp oligos should need fewer total"
-    print(f"  PASS: different_oligo_lengths (60bp: {len(oligos)} oligos vs 45bp: {len(oligos_short)} oligos)")
+    print(f"  PASS: different_max_oligo_lengths (60bp: {len(oligos)} oligos vs 45bp: {len(oligos_short)} oligos)")
 
 
-def test_oligo_length_hard_cap():
+def test_max_oligo_length_hard_cap():
     """Across many lengths, no oligo should ever exceed the user-set cap."""
     for oligo_len in [40, 45, 50, 60, 80, 100]:
-        oligos, _ = tile_sequence(TEST_SEQ_500, oligo_length=oligo_len, overlap_length=20)
+        oligos, _ = tile_sequence(TEST_SEQ_500, max_oligo_length=oligo_len, overlap_length=20)
         over = [o for o in oligos if o.length > oligo_len]
         assert not over, (
-            f"oligo_length={oligo_len}: violations "
+            f"max_oligo_length={oligo_len}: violations "
             f"{[(o.index, o.length) for o in over]}"
         )
         # Round-trip assembly still works (we didn't break tiling).
         assembled = assemble_in_silico(oligos, TEST_SEQ_500)
-        assert assembled == TEST_SEQ_500, f"oligo_length={oligo_len}: assembly broken"
-    print(f"  PASS: oligo_length_hard_cap (40,45,50,60,80,100)")
+        assert assembled == TEST_SEQ_500, f"max_oligo_length={oligo_len}: assembly broken"
+    print(f"  PASS: max_oligo_length_hard_cap (40,45,50,60,80,100)")
 
 
 def test_gblock_tiling_covers_plasmid_flanks():
@@ -240,7 +240,7 @@ def test_gblock_tiling_covers_plasmid_flanks():
 
     gblocks = [(64, 191, "G1"), (324, 451, "G2")]
     oligos, overlaps, gfrag = tile_sequence_with_gblocks(
-        insert, gblock_regions=gblocks, oligo_length=60, overlap_length=20,
+        insert, gblock_regions=gblocks, max_oligo_length=60, overlap_length=20,
         plasmid_upstream=upstream, plasmid_downstream=downstream,
     )
 
@@ -265,8 +265,8 @@ def test_gblock_tiling_covers_plasmid_flanks():
     print(f"  PASS: gblock_tiling_covers_plasmid_flanks")
 
 
-def test_gblock_extension_respects_oligo_length():
-    """Regression: an oligo next to a gBlock must not exceed oligo_length
+def test_gblock_extension_respects_max_oligo_length():
+    """Regression: an oligo next to a gBlock must not exceed max_oligo_length
     after being extended into the gBlock for Gibson overlap.
 
     Scenario mirrors a real case from the codon-optimized GLP-1 construct:
@@ -284,7 +284,7 @@ def test_gblock_extension_respects_oligo_length():
         (324, 451, "G2"),  # second gBlock further along
     ]
     oligos, overlaps, gblock_frags = tile_sequence_with_gblocks(
-        seq, gblock_regions=gblocks, oligo_length=60, overlap_length=20,
+        seq, gblock_regions=gblocks, max_oligo_length=60, overlap_length=20,
     )
     over = [(o.index, o.length) for o in oligos if o.length > 60]
     assert not over, (
@@ -296,13 +296,13 @@ def test_gblock_extension_respects_oligo_length():
     for oligo_len in [40, 50, 60, 80, 100, 120]:
         olg, _, _ = tile_sequence_with_gblocks(
             seq, gblock_regions=gblocks,
-            oligo_length=oligo_len, overlap_length=20,
+            max_oligo_length=oligo_len, overlap_length=20,
         )
         over = [(o.index, o.length) for o in olg if o.length > oligo_len]
         assert not over, (
-            f"oligo_length={oligo_len} with gBlocks: violations {over}"
+            f"max_oligo_length={oligo_len} with gBlocks: violations {over}"
         )
-    print(f"  PASS: gblock_extension_respects_oligo_length")
+    print(f"  PASS: gblock_extension_respects_max_oligo_length")
 
 
 def test_all_overlaps_correct_length():
@@ -325,9 +325,9 @@ if __name__ == "__main__":
     test_in_silico_assembly_with_flanks()
     test_polyg_detection()
     test_cross_hybridization()
-    test_different_oligo_lengths()
-    test_oligo_length_hard_cap()
+    test_different_max_oligo_lengths()
+    test_max_oligo_length_hard_cap()
     test_gblock_tiling_covers_plasmid_flanks()
-    test_gblock_extension_respects_oligo_length()
+    test_gblock_extension_respects_max_oligo_length()
     test_all_overlaps_correct_length()
     print("\nAll tests passed!")

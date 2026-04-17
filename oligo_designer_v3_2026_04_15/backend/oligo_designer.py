@@ -184,14 +184,17 @@ def check_overlap(overlap: Overlap, full_seq: str) -> list[OverlapIssue]:
     issues = []
     seq = overlap.seq.upper()
 
-    # Homopolymer runs — pinpoint the exact run within the construct
+    # Homopolymer runs — pinpoint the exact run within the construct.
+    # Positions in `message` use 1-indexed inclusive form (biology convention)
+    # to match the UI's "(nt, 1-indexed)" labels. Structured start/end fields
+    # stay 0-indexed half-open for internal math.
     homos = find_homopolymers(seq, min_run=4)
     for hp_start, hp_end, base in homos:
         run_len = hp_end - hp_start
         sev = "error" if run_len >= 6 else "warning"
         issues.append(OverlapIssue(
             "homopolymer",
-            f"{run_len}x {base} at pos {overlap.start + hp_start}-{overlap.start + hp_end}",
+            f"{run_len}x {base} at pos {overlap.start + hp_start + 1}-{overlap.start + hp_end}",
             sev,
             start=overlap.start + hp_start,
             end=overlap.start + hp_end,
@@ -205,7 +208,7 @@ def check_overlap(overlap: Overlap, full_seq: str) -> list[OverlapIssue]:
         issues.append(OverlapIssue(
             "g_quadruplex",
             f"G-quadruplex: {n_runs} {letter}-runs at "
-            f"{overlap.start + q_start}-{overlap.start + q_end}{strand_suffix}",
+            f"{overlap.start + q_start + 1}-{overlap.start + q_end}{strand_suffix}",
             "error",
             start=overlap.start + q_start,
             end=overlap.start + q_end,
@@ -282,7 +285,7 @@ def check_cross_hybridization(
 
 def tile_sequence(
     seq: str,
-    oligo_length: int = 45,
+    max_oligo_length: int = 45,
     overlap_length: int = 20,
     plasmid_upstream: str = "",
     plasmid_downstream: str = "",
@@ -298,15 +301,15 @@ def tile_sequence(
       Oligo 3 (sense):                =========>
       ...
 
-    Each oligo covers `oligo_length` bp of the construct.
+    Each oligo covers `max_oligo_length` bp of the construct.
     Adjacent oligos share `overlap_length` bp overlaps.
-    The step size = oligo_length - overlap_length.
+    The step size = max_oligo_length - overlap_length.
 
     Parameters
     ----------
     seq : str
         The DNA insert sequence (sense strand, 5'->3').
-    oligo_length : int
+    max_oligo_length : int
         Target oligo length in bp (default 45).
     overlap_length : int
         Target overlap between adjacent oligos (default 20).
@@ -329,12 +332,12 @@ def tile_sequence(
     insert_start = len(plasmid_upstream)
     insert_end = insert_start + len(seq)
 
-    step = oligo_length - overlap_length
+    step = max_oligo_length - overlap_length
 
     # Generate cut points (positions where one oligo ends and the overlap begins)
     # First oligo starts at position 0 of full_seq
     cut_points = []
-    pos = oligo_length  # end of first oligo
+    pos = max_oligo_length  # end of first oligo
     while pos < len(full_seq):
         cut_points.append(pos - overlap_length)  # start of overlap region
         pos += step
@@ -353,15 +356,15 @@ def tile_sequence(
     # `placed_kmers` accumulates k-mers from overlaps we've already chosen;
     # each subsequent cut is scored against this set.
     #
-    # We also enforce a HARD MAX of `oligo_length` per oligo by bounding
+    # We also enforce a HARD MAX of `max_oligo_length` per oligo by bounding
     # each cut against the previous one. The relevant equations:
-    #   oligo[0]      length = cut[0] + overlap_length            <= oligo_length
-    #   oligo[i]      length = (cut[i] - cut[i-1]) + overlap_length <= oligo_length
-    #   oligo[N]      length = len(full_seq) - cut[N-1]           <= oligo_length
+    #   oligo[0]      length = cut[0] + overlap_length            <= max_oligo_length
+    #   oligo[i]      length = (cut[i] - cut[i-1]) + overlap_length <= max_oligo_length
+    #   oligo[N]      length = len(full_seq) - cut[N-1]           <= max_oligo_length
     # Translating each to a position bound on the cut being placed:
-    #   first cut:  cut[0] in [overlap_length, oligo_length - overlap_length]
+    #   first cut:  cut[0] in [overlap_length, max_oligo_length - overlap_length]
     #   middle:     cut[i] in [cut[i-1] + overlap_length, cut[i-1] + step]
-    #   last cut:   cut[N-1] in [max(prev+overlap, len_seq - oligo_length),
+    #   last cut:   cut[N-1] in [max(prev+overlap, len_seq - max_oligo_length),
     #                            prev + step]
     # This may make the search asymmetric (e.g. only LEFT shifts allowed
     # for the first cut), but it guarantees no oligo exceeds the user's
@@ -373,18 +376,18 @@ def tile_sequence(
         prev_bound = optimized_cuts[-1] if optimized_cuts else -(overlap_length * 2)
         next_bound = cut_points[idx + 1] if idx + 1 < n_cuts else len(full_seq) + overlap_length
 
-        # Per-cut hard bounds enforcing oligo_length on the oligos this cut
+        # Per-cut hard bounds enforcing max_oligo_length on the oligos this cut
         # closes (the one to its LEFT) and, for the last cut, the trailing
         # oligo to its RIGHT.
         if idx == 0:
             cut_min_i = overlap_length
-            cut_max_i = oligo_length - overlap_length
+            cut_max_i = max_oligo_length - overlap_length
         else:
             cut_min_i = optimized_cuts[-1] + overlap_length
             cut_max_i = optimized_cuts[-1] + step
         if idx == n_cuts - 1:
-            # Last cut also caps the trailing oligo: len_seq - cut <= oligo_length
-            cut_min_i = max(cut_min_i, len(full_seq) - oligo_length)
+            # Last cut also caps the trailing oligo: len_seq - cut <= max_oligo_length
+            cut_min_i = max(cut_min_i, len(full_seq) - max_oligo_length)
 
         best_cut, _best_score, _n_conflicts = _optimize_cut(
             full_seq, cut, overlap_length, step,
@@ -480,7 +483,7 @@ def tile_sequence(
 def tile_sequence_with_gblocks(
     seq: str,
     gblock_regions: list[tuple[int, int, str]],
-    oligo_length: int = 60,
+    max_oligo_length: int = 60,
     overlap_length: int = 20,
     plasmid_upstream: str = "",
     plasmid_downstream: str = "",
@@ -506,7 +509,7 @@ def tile_sequence_with_gblocks(
 
     full_seq = plasmid_upstream.upper() + seq + plasmid_downstream.upper()
     insert_start = len(plasmid_upstream)
-    step = oligo_length - overlap_length
+    step = max_oligo_length - overlap_length
     thermo = conditions.make_thermo()
     target_tm = conditions.annealing_temp + 12.0
 
@@ -591,7 +594,7 @@ def tile_sequence_with_gblocks(
         # later be extended by overlap_length INTO the gBlock to create
         # the Gibson overlap. That extension has to be counted here when
         # we decide how many cuts to place — otherwise the boundary
-        # oligo can blow past oligo_length.
+        # oligo can blow past max_oligo_length.
         bord_L = seg_idx > 0 and segments[seg_idx - 1][0] == "gblock"
         bord_R = seg_idx < len(segments) - 1 and segments[seg_idx + 1][0] == "gblock"
 
@@ -601,10 +604,10 @@ def tile_sequence_with_gblocks(
         re_eff = re + overlap_length if bord_R else re
         eff_span = re_eff - rs_eff
 
-        # Minimum number of oligos to tile eff_span with each oligo <= oligo_length:
-        #   N*oligo_length - (N-1)*overlap >= eff_span
+        # Minimum number of oligos to tile eff_span with each oligo <= max_oligo_length:
+        #   N*max_oligo_length - (N-1)*overlap >= eff_span
         #   N >= (eff_span - overlap) / step
-        if eff_span <= oligo_length:
+        if eff_span <= max_oligo_length:
             n_oligos = 1
         else:
             n_oligos = (eff_span - overlap_length + step - 1) // step  # ceil
@@ -617,19 +620,19 @@ def tile_sequence_with_gblocks(
         # so we just generate exactly n_region_cuts evenly-spaced cuts.
         cuts: list[int] = []
         if n_region_cuts > 0:
-            pos = rs_eff + oligo_length
+            pos = rs_eff + max_oligo_length
             for _ in range(n_region_cuts):
                 cuts.append(pos - overlap_length)
                 pos += step
 
         # Cut placement. Bounds enforce per-oligo length cap, properly
         # accounting for the gBlock extensions at region boundaries.
-        #   oligo_0 length = cut[0] + overlap - rs_eff         <= oligo_length
+        #   oligo_0 length = cut[0] + overlap - rs_eff         <= max_oligo_length
         #       => cut[0] <= rs_eff + step
-        #   oligo_i length = cut[i] - cut[i-1] + overlap        <= oligo_length
+        #   oligo_i length = cut[i] - cut[i-1] + overlap        <= max_oligo_length
         #       => cut[i] <= cut[i-1] + step
-        #   oligo_N length = re_eff - cut[N-1]                  <= oligo_length
-        #       => cut[N-1] >= re_eff - oligo_length
+        #   oligo_N length = re_eff - cut[N-1]                  <= max_oligo_length
+        #       => cut[N-1] >= re_eff - max_oligo_length
         # Physical constraint: cuts must stay inside [rs, re - overlap]
         # so the outgoing overlap [cut, cut+overlap] fits inside the
         # physical region. cut == rs is allowed — it corresponds to a
@@ -637,7 +640,7 @@ def tile_sequence_with_gblocks(
         # the gBlock-extension plus the outgoing overlap (length =
         # 2*overlap_length, no unique middle content). This is the
         # minimum boundary oligo size and it's what lets small
-        # oligo_length values (e.g. 50bp with 20bp overlaps) work.
+        # max_oligo_length values (e.g. 50bp with 20bp overlaps) work.
         opt_cuts: list[int] = []
         for idx, cut in enumerate(cuts):
             prev_bound = opt_cuts[-1] if opt_cuts else rs - overlap_length
@@ -650,7 +653,7 @@ def tile_sequence_with_gblocks(
                 cut_min_i = opt_cuts[-1] + overlap_length
                 cut_max_i = opt_cuts[-1] + step
             if idx == n_region_cuts - 1:
-                cut_min_i = max(cut_min_i, re_eff - oligo_length)
+                cut_min_i = max(cut_min_i, re_eff - max_oligo_length)
 
             best_cut, _s, _c = _optimize_cut(
                 full_seq, cut, overlap_length, step,
@@ -883,7 +886,7 @@ def _optimize_cut(
     `cut_min` and `cut_max`, if provided, are HARD bounds on the cut
     position. They are used by the caller to enforce per-oligo length
     limits (e.g. cut[i] <= cut[i-1] + step keeps oligo i within
-    `oligo_length`). Any candidate outside [cut_min, cut_max] is rejected.
+    `max_oligo_length`). Any candidate outside [cut_min, cut_max] is rejected.
 
     Returns (best_cut, best_score, n_kmer_conflicts_at_best).
     """
@@ -968,6 +971,10 @@ def scan_sequence_complexity(seq: str) -> list[dict]:
     s = seq.upper()
 
     # Homopolymer runs
+    # Positions in `message` are rendered in 1-indexed inclusive form
+    # (biology convention) to match the UI's "(nt, 1-indexed)" labels.
+    # Structured `start`/`end` remain 0-indexed half-open, consistent with
+    # all other coordinate fields returned by the tiler.
     for start, end, base in find_homopolymers(s, min_run=5):
         issues.append({
             "type": "homopolymer",
@@ -975,7 +982,7 @@ def scan_sequence_complexity(seq: str) -> list[dict]:
             "end": end,
             "value": f"{end-start}x{base}",
             "severity": "error" if end - start >= 8 else "warning",
-            "message": f"Homopolymer run: {end-start}x {base} at {start}-{end}"
+            "message": f"Homopolymer run: {end-start}x {base} at {start + 1}-{end}"
         })
 
     # G-quadruplex
@@ -988,7 +995,7 @@ def scan_sequence_complexity(seq: str) -> list[dict]:
             "end": qend,
             "severity": "error",
             "message": f"G-quadruplex: {n_runs} {letter}-runs at "
-                       f"{qstart}-{qend}{strand_suffix}"
+                       f"{qstart + 1}-{qend}{strand_suffix}"
         })
 
     return issues
@@ -1179,7 +1186,7 @@ def read_fasta_or_raw(path: str) -> tuple[str, str]:
 
 def design_oligos(
     seq: str,
-    oligo_length: int = 45,
+    max_oligo_length: int = 45,
     overlap_length: int = 20,
     plasmid_upstream: str = "",
     plasmid_downstream: str = "",
@@ -1195,7 +1202,7 @@ def design_oligos(
     # Tile
     oligos, overlaps = tile_sequence(
         seq,
-        oligo_length=oligo_length,
+        max_oligo_length=max_oligo_length,
         overlap_length=overlap_length,
         plasmid_upstream=plasmid_upstream,
         plasmid_downstream=plasmid_downstream,
@@ -1220,8 +1227,8 @@ def main():
         help="DNA sequence (string) or path to FASTA/text file"
     )
     parser.add_argument(
-        "--oligo-length", type=int, default=45,
-        help="Target oligo length in bp (default: 45)"
+        "--max-oligo-length", type=int, default=45,
+        help="Maximum oligo length in bp (hard cap; default: 45)"
     )
     parser.add_argument(
         "--overlap", type=int, default=20,
@@ -1252,7 +1259,7 @@ def main():
 
     report = design_oligos(
         seq,
-        oligo_length=args.oligo_length,
+        max_oligo_length=args.max_oligo_length,
         overlap_length=args.overlap,
         plasmid_upstream=args.upstream,
         plasmid_downstream=args.downstream,
