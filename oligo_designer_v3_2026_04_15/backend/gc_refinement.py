@@ -43,6 +43,15 @@ def refine_gc_windows(
     - No matches for avoid_patterns
     - No codon with frequency < min_codon_frequency (when alternatives exist)
 
+    The beam is bucketed by (window GC count, last-codon GC count) and we
+    keep the top ``beam_k`` paths per bucket by loss.  The bucket key is
+    deliberately GC-only — homopolymer/avoid-pattern state is captured
+    implicitly by keeping ``beam_k`` diverse tails per bucket rather than
+    explicitly in the key.  We benchmarked adding run-base/run-length to
+    the bucket key (see test_bucket_key_homo.py) and observed zero quality
+    improvement with a 25–85% runtime cost across 12 protein/profile
+    combinations, so we keep the GC-only approach.
+
     Returns (refined_dna, freq_warnings, optimization_report).
     """
     n_codons = len(dna) // 3

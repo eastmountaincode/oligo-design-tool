@@ -277,7 +277,8 @@ class CodonOptRequest(BaseModel):
     uniquify_kmers: int = Field(10, ge=6, le=20, description="Max repeated k-mer length to eliminate")
     avoid_patterns: list[str] = Field(default_factory=list, description="Additional patterns to avoid (regex)")
     min_codon_frequency: float = Field(10.0, ge=0.0, le=100.0, description="Minimum codon frequency (/1000) allowed")
-    beam_k: int = Field(250, ge=1, le=500, description="Beam search width per bucket. Higher = better quality, slower.")
+    beam_k: int = Field(250, ge=1, description="Beam search width per bucket. Higher = better quality, slower.")
+    auto_detect_gblocks: bool = Field(True, description="If the whole-protein beam fails, iteratively mark difficult regions as gBlocks and retry. Otherwise error out.")
     gblock_regions: list[GBlockRegionInput] = Field(default_factory=list, description="Regions to be ordered as IDT gBlocks (relaxed synthesis constraints)")
 
 
@@ -836,8 +837,12 @@ def _run_codon_optimize(req: CodonOptRequest, progress_callback=None) -> CodonOp
         )
 
         # AUTO-DETECT: if beam failed, iteratively find minimal gBlock regions
-        # and re-run with per-segment optimization.
-        if opt_report.get("source") in ("beam_pruned_empty", "beam_no_solution"):
+        # and re-run with per-segment optimization.  Only runs when the user
+        # has opted in via auto_detect_gblocks (default True).
+        if (
+            req.auto_detect_gblocks
+            and opt_report.get("source") in ("beam_pruned_empty", "beam_no_solution")
+        ):
             if progress_callback:
                 progress_callback("gblock_detect", 0, 1)
 

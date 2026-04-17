@@ -125,6 +125,7 @@ export default function CodonOptPage({ onDnaChanged, onGblocksChanged, prefillDn
   const [uniquifyKmers, setUniquifyKmers] = useState(10);
   const [minCodonFrequency, setMinCodonFrequency] = useState(10);
   const [beamK, setBeamK] = useState(250);
+  const [autoDetectGblocks, setAutoDetectGblocks] = useState(true);
   const [avoidPatterns, setAvoidPatterns] = useState("");
   const [gblockRegions, setGblockRegions] = useState<GBlockRegion[]>([]);
   const [progress, setProgress] = useState<{ stage: string; current: number; total: number } | null>(null);
@@ -213,6 +214,7 @@ export default function CodonOptPage({ onDnaChanged, onGblocksChanged, prefillDn
         avoid_patterns: patterns,
         min_codon_frequency: minCodonFrequency,
         beam_k: beamK,
+        auto_detect_gblocks: autoDetectGblocks,
         gblock_regions: gblockRegions.map((r) => ({
           start_aa: Math.floor(r.startBp / 3),
           end_aa: Math.floor(r.endBp / 3) - 1,
@@ -491,7 +493,7 @@ export default function CodonOptPage({ onDnaChanged, onGblocksChanged, prefillDn
           )}
         </div>
 
-        <details className="text-sm">
+        <details className="text-sm" open>
           <summary className="cursor-pointer text-[#5f6368] hover:text-[#202124]">
             Synthesis constraints
           </summary>
@@ -576,7 +578,7 @@ export default function CodonOptPage({ onDnaChanged, onGblocksChanged, prefillDn
                   </span>
                 </td>
                 <td className="py-1.5 align-middle">
-                  <NumericInput value={beamK} onChange={setBeamK} min={1} max={500} className="w-16 bg-white border border-[#dadce0] px-2 py-1 text-sm text-[#202124] focus:border-[#1a73e8] focus:outline-none" />
+                  <NumericInput value={beamK} onChange={setBeamK} min={1} className="w-16 bg-white border border-[#dadce0] px-2 py-1 text-sm text-[#202124] focus:border-[#1a73e8] focus:outline-none" />
                 </td>
               </tr>
               <tr>
@@ -588,6 +590,22 @@ export default function CodonOptPage({ onDnaChanged, onGblocksChanged, prefillDn
                 </td>
                 <td colSpan={5} className="py-1.5 align-middle">
                   <input type="text" value={avoidPatterns} onChange={(e) => setAvoidPatterns(e.target.value)} placeholder="e.g. GAATTC, GGATCC" className="w-full bg-white border border-[#dadce0] px-2 py-1 font-mono text-sm text-[#202124] focus:border-[#1a73e8] focus:outline-none" />
+                </td>
+              </tr>
+              <tr>
+                <td colSpan={6} className="py-1.5 align-middle">
+                  <label className="flex items-center gap-2 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={autoDetectGblocks}
+                      onChange={(e) => setAutoDetectGblocks(e.target.checked)}
+                      className="cursor-pointer"
+                    />
+                    <span className="text-[#5f6368] flex items-center gap-1">
+                      Auto-detect gBlock regions on beam failure
+                      <InfoTip text="If the beam search fails to find a solution under the current constraints, automatically mark the problematic regions as gBlocks (with IDT's looser synthesis limits) and retry. Disable to get an explicit error instead, so you can adjust constraints or draw regions manually." />
+                    </span>
+                  </label>
                 </td>
               </tr>
             </tbody>
