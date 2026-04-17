@@ -352,11 +352,40 @@ def tile_sequence(
     # Greedy left-to-right cut placement with cross-hyb awareness.
     # `placed_kmers` accumulates k-mers from overlaps we've already chosen;
     # each subsequent cut is scored against this set.
+    #
+    # We also enforce a HARD MAX of `oligo_length` per oligo by bounding
+    # each cut against the previous one. The relevant equations:
+    #   oligo[0]      length = cut[0] + overlap_length            <= oligo_length
+    #   oligo[i]      length = (cut[i] - cut[i-1]) + overlap_length <= oligo_length
+    #   oligo[N]      length = len(full_seq) - cut[N-1]           <= oligo_length
+    # Translating each to a position bound on the cut being placed:
+    #   first cut:  cut[0] in [overlap_length, oligo_length - overlap_length]
+    #   middle:     cut[i] in [cut[i-1] + overlap_length, cut[i-1] + step]
+    #   last cut:   cut[N-1] in [max(prev+overlap, len_seq - oligo_length),
+    #                            prev + step]
+    # This may make the search asymmetric (e.g. only LEFT shifts allowed
+    # for the first cut), but it guarantees no oligo exceeds the user's
+    # length cap — which is the IDT pricing-tier constraint.
     placed_kmers: set[str] = set()
     optimized_cuts: list[int] = []
+    n_cuts = len(cut_points)
     for idx, cut in enumerate(cut_points):
         prev_bound = optimized_cuts[-1] if optimized_cuts else -(overlap_length * 2)
-        next_bound = cut_points[idx + 1] if idx + 1 < len(cut_points) else len(full_seq) + overlap_length
+        next_bound = cut_points[idx + 1] if idx + 1 < n_cuts else len(full_seq) + overlap_length
+
+        # Per-cut hard bounds enforcing oligo_length on the oligos this cut
+        # closes (the one to its LEFT) and, for the last cut, the trailing
+        # oligo to its RIGHT.
+        if idx == 0:
+            cut_min_i = overlap_length
+            cut_max_i = oligo_length - overlap_length
+        else:
+            cut_min_i = optimized_cuts[-1] + overlap_length
+            cut_max_i = optimized_cuts[-1] + step
+        if idx == n_cuts - 1:
+            # Last cut also caps the trailing oligo: len_seq - cut <= oligo_length
+            cut_min_i = max(cut_min_i, len(full_seq) - oligo_length)
+
         best_cut, _best_score, _n_conflicts = _optimize_cut(
             full_seq, cut, overlap_length, step,
             thermo=_thermo, target_tm=_target_tm,
@@ -366,6 +395,8 @@ def tile_sequence(
             seq_min=overlap_length,
             seq_max=len(full_seq),
             base_shift=max_shift,
+            cut_min=cut_min_i,
+            cut_max=cut_max_i,
         )
         optimized_cuts.append(best_cut)
         placed_kmers |= _kmer_set_bidirectional(full_seq[best_cut:best_cut + overlap_length])
@@ -545,52 +576,106 @@ def tile_sequence_with_gblocks(
     # Every fragment extends overlap_length past the next fragment's start.
     fragments = []  # [(type, start, end, label)]  — in full_seq coords
 
-    for seg in segments:
+    for seg_idx, seg in enumerate(segments):
         if seg[0] == "gblock":
             _, gs, ge, label = seg
             fragments.append(("gblock", gs, ge, label))
-        else:
-            _, rs, re = seg
-            region_len = re - rs
-            if region_len <= 0:
-                continue
+            continue
 
-            # Place cut points within this oligo region
-            cuts = []
-            pos = rs + oligo_length
-            while pos < re:
+        _, rs, re = seg
+        region_len = re - rs
+        if region_len <= 0:
+            continue
+
+        # If this oligo region abuts a gBlock, its boundary oligo will
+        # later be extended by overlap_length INTO the gBlock to create
+        # the Gibson overlap. That extension has to be counted here when
+        # we decide how many cuts to place — otherwise the boundary
+        # oligo can blow past oligo_length.
+        bord_L = seg_idx > 0 and segments[seg_idx - 1][0] == "gblock"
+        bord_R = seg_idx < len(segments) - 1 and segments[seg_idx + 1][0] == "gblock"
+
+        # Effective endpoints: where the first and last oligos actually
+        # start / end after gBlock extensions.
+        rs_eff = rs - overlap_length if bord_L else rs
+        re_eff = re + overlap_length if bord_R else re
+        eff_span = re_eff - rs_eff
+
+        # Minimum number of oligos to tile eff_span with each oligo <= oligo_length:
+        #   N*oligo_length - (N-1)*overlap >= eff_span
+        #   N >= (eff_span - overlap) / step
+        if eff_span <= oligo_length:
+            n_oligos = 1
+        else:
+            n_oligos = (eff_span - overlap_length + step - 1) // step  # ceil
+            n_oligos = max(1, n_oligos)
+        n_region_cuts = n_oligos - 1
+
+        # Nominal cut positions: same tiling rule as tile_sequence, just
+        # anchored to the effective endpoints. The while-loop would
+        # over-count on short regions where we manually set n_region_cuts,
+        # so we just generate exactly n_region_cuts evenly-spaced cuts.
+        cuts: list[int] = []
+        if n_region_cuts > 0:
+            pos = rs_eff + oligo_length
+            for _ in range(n_region_cuts):
                 cuts.append(pos - overlap_length)
                 pos += step
 
-            # Cut placement for this oligo region — uses and updates the
-            # global placed_kmers so cross-hyb with both gBlock boundaries
-            # and earlier oligo cuts is avoided.
-            opt_cuts: list[int] = []
-            for idx, cut in enumerate(cuts):
-                prev_bound = opt_cuts[-1] if opt_cuts else rs - overlap_length
-                next_bound = cuts[idx + 1] if idx + 1 < len(cuts) else re + overlap_length
-                best_cut, _s, _c = _optimize_cut(
-                    full_seq, cut, overlap_length, step,
-                    thermo=thermo, target_tm=target_tm,
-                    placed_kmers=placed_kmers,
-                    prev_cut_bound=prev_bound,
-                    next_cut_bound=next_bound,
-                    seq_min=rs + overlap_length,
-                    seq_max=re,
-                    base_shift=max_shift,
-                )
-                opt_cuts.append(best_cut)
-                placed_kmers |= _kmer_set_bidirectional(
-                    full_seq[best_cut:best_cut + overlap_length]
-                )
+        # Cut placement. Bounds enforce per-oligo length cap, properly
+        # accounting for the gBlock extensions at region boundaries.
+        #   oligo_0 length = cut[0] + overlap - rs_eff         <= oligo_length
+        #       => cut[0] <= rs_eff + step
+        #   oligo_i length = cut[i] - cut[i-1] + overlap        <= oligo_length
+        #       => cut[i] <= cut[i-1] + step
+        #   oligo_N length = re_eff - cut[N-1]                  <= oligo_length
+        #       => cut[N-1] >= re_eff - oligo_length
+        # Physical constraint: cuts must stay inside [rs, re - overlap]
+        # so the outgoing overlap [cut, cut+overlap] fits inside the
+        # physical region. cut == rs is allowed — it corresponds to a
+        # valid "bridge oligo" pattern where the boundary oligo is just
+        # the gBlock-extension plus the outgoing overlap (length =
+        # 2*overlap_length, no unique middle content). This is the
+        # minimum boundary oligo size and it's what lets small
+        # oligo_length values (e.g. 50bp with 20bp overlaps) work.
+        opt_cuts: list[int] = []
+        for idx, cut in enumerate(cuts):
+            prev_bound = opt_cuts[-1] if opt_cuts else rs - overlap_length
+            next_bound = cuts[idx + 1] if idx + 1 < n_region_cuts else re + overlap_length
 
-            # Build oligo fragments from boundaries within this region
-            bounds = [rs] + opt_cuts + [re]
-            for i in range(len(bounds) - 1):
-                frag_start = bounds[i]
-                frag_end = bounds[i + 1] + overlap_length if i < len(bounds) - 2 else bounds[i + 1]
-                frag_end = min(frag_end, len(full_seq))
-                fragments.append(("oligo", frag_start, frag_end, ""))
+            if idx == 0:
+                cut_min_i = rs
+                cut_max_i = rs_eff + step
+            else:
+                cut_min_i = opt_cuts[-1] + overlap_length
+                cut_max_i = opt_cuts[-1] + step
+            if idx == n_region_cuts - 1:
+                cut_min_i = max(cut_min_i, re_eff - oligo_length)
+
+            best_cut, _s, _c = _optimize_cut(
+                full_seq, cut, overlap_length, step,
+                thermo=thermo, target_tm=target_tm,
+                placed_kmers=placed_kmers,
+                prev_cut_bound=prev_bound,
+                next_cut_bound=next_bound,
+                seq_min=rs,
+                seq_max=re,
+                base_shift=max_shift,
+                cut_min=cut_min_i,
+                cut_max=cut_max_i,
+            )
+            opt_cuts.append(best_cut)
+            placed_kmers |= _kmer_set_bidirectional(
+                full_seq[best_cut:best_cut + overlap_length]
+            )
+
+        # Build oligo fragments from boundaries within this region
+        bounds = [rs] + opt_cuts + [re]
+        for i in range(len(bounds) - 1):
+            frag_start = bounds[i]
+            frag_end = bounds[i + 1] + overlap_length if i < len(bounds) - 2 else bounds[i + 1]
+            frag_end = min(frag_end, len(full_seq))
+            fragments.append(("oligo", frag_start, frag_end, ""))
 
     # Sort fragments by start position. gBlocks sort before oligos at the
     # same position so that the extension step correctly identifies neighbors.
@@ -621,15 +706,17 @@ def tile_sequence_with_gblocks(
     gblock_fragments = []
     oligo_idx = 0
 
+    # All emitted positions (oligo/gBlock/overlap start/end) are in
+    # FULL_SEQ coordinates — consistent with tile_sequence() and with
+    # what the frontend's fullSequence (upstream + insert + downstream)
+    # expects. When plasmid flanks are empty, insert_start == 0 and
+    # full_seq coords == insert coords, so legacy behavior is preserved.
     for i, (frag_type, frag_start, frag_end, label) in enumerate(fragments):
-        ins_start = frag_start - insert_start
-        ins_end = frag_end - insert_start
-
         if frag_type == "gblock":
             gblock_fragments.append(GBlockFragment(
                 index=len(gblock_fragments),
-                seq=seq[ins_start:ins_end],
-                start=ins_start, end=ins_end, label=label,
+                seq=full_seq[frag_start:frag_end],
+                start=frag_start, end=frag_end, label=label,
             ))
         else:
             frag_seq = full_seq[frag_start:frag_end]
@@ -638,7 +725,7 @@ def tile_sequence_with_gblocks(
                 frag_seq = reverse_complement(frag_seq)
             oligos.append(Oligo(
                 index=oligo_idx, seq=frag_seq,
-                start=ins_start, end=ins_end, strand=strand,
+                start=frag_start, end=frag_end, strand=strand,
                 is_first=(frag_start == 0),
                 is_last=(frag_end == len(full_seq)),
             ))
@@ -655,8 +742,8 @@ def tile_sequence_with_gblocks(
                 ovl_seq = full_seq[ovl_start:ovl_end]
                 ovl_obj = Overlap(
                     seq=ovl_seq,
-                    start=ovl_start - insert_start,
-                    end=ovl_end - insert_start,
+                    start=ovl_start,
+                    end=ovl_end,
                     tm=thermo.calc_tm(ovl_seq),
                 )
                 ovl_obj.issues = check_overlap(ovl_obj, full_seq)
@@ -783,6 +870,8 @@ def _optimize_cut(
     seq_max: int,            # hard upper bound (usually = len(full_seq))
     base_shift: int = 5,
     widen_cap: int | None = None,
+    cut_min: int | None = None,  # hard lower bound on the cut position itself
+    cut_max: int | None = None,  # hard upper bound on the cut position itself
 ) -> tuple[int, float, int]:
     """Pick the best cut position around `nominal_cut`.
 
@@ -791,15 +880,33 @@ def _optimize_cut(
     largest span the spacing constraints permit) to try to find a clean
     window.
 
+    `cut_min` and `cut_max`, if provided, are HARD bounds on the cut
+    position. They are used by the caller to enforce per-oligo length
+    limits (e.g. cut[i] <= cut[i-1] + step keeps oligo i within
+    `oligo_length`). Any candidate outside [cut_min, cut_max] is rejected.
+
     Returns (best_cut, best_score, n_kmer_conflicts_at_best).
     """
+    # Effective hard bounds combining all sources.
+    hard_min = max(seq_min, prev_cut_bound + overlap_length)
+    if cut_min is not None:
+        hard_min = max(hard_min, cut_min)
+    hard_max = min(seq_max - overlap_length, next_cut_bound - overlap_length)
+    if cut_max is not None:
+        hard_max = min(hard_max, cut_max)
+
+    # If bounds are infeasible, fall back to the closest feasible position.
+    # This can happen when the caller's nominal placement is too tight; we
+    # prefer "shorter than ideal" over "infeasible" so the assembly still
+    # tiles the whole sequence.
+    if hard_min > hard_max:
+        clipped = max(seq_min, min(seq_max - overlap_length, nominal_cut))
+        return clipped, -999.0, 0
+
     # Max symmetric shift that still satisfies spacing constraints.
     max_feasible_shift = max(
         0,
-        min(
-            nominal_cut - max(prev_cut_bound + overlap_length, seq_min),
-            min(next_cut_bound, seq_max) - overlap_length - nominal_cut,
-        ),
+        min(nominal_cut - hard_min, hard_max - nominal_cut),
     )
     if widen_cap is None:
         widen_cap = max_feasible_shift
@@ -807,21 +914,16 @@ def _optimize_cut(
         widen_cap = min(widen_cap, max_feasible_shift)
 
     def _search(shift: int) -> tuple[int, float, int]:
-        best_c = nominal_cut
-        best_s = _score_overlap(
-            full_seq, nominal_cut, overlap_length, step,
-            thermo=thermo, target_tm=target_tm, placed_kmers=placed_kmers,
-        )
-        best_n = _count_kmer_conflicts(
-            full_seq[nominal_cut:nominal_cut + overlap_length], placed_kmers,
-        )
+        # Start with no candidate. We'll accept the first valid one we see
+        # and improve from there. (Initializing with `nominal_cut` directly
+        # was buggy — if nominal violated cut_min/cut_max we'd return an
+        # out-of-bounds cut.)
+        best_c: int | None = None
+        best_s: float = float("-inf")
+        best_n: int = 0
         for s in range(-shift, shift + 1):
             c = nominal_cut + s
-            if c < seq_min or c + overlap_length > seq_max:
-                continue
-            if c - prev_cut_bound < overlap_length:
-                continue
-            if next_cut_bound - c < overlap_length:
+            if c < hard_min or c > hard_max:
                 continue
             score = _score_overlap(
                 full_seq, c, overlap_length, step,
@@ -833,6 +935,17 @@ def _optimize_cut(
                 best_n = _count_kmer_conflicts(
                     full_seq[c:c + overlap_length], placed_kmers,
                 )
+        if best_c is None:
+            # No candidate in the search window — fall back to the closest
+            # feasible position to nominal so we still produce a tiling.
+            best_c = max(hard_min, min(hard_max, nominal_cut))
+            best_s = _score_overlap(
+                full_seq, best_c, overlap_length, step,
+                thermo=thermo, target_tm=target_tm, placed_kmers=placed_kmers,
+            )
+            best_n = _count_kmer_conflicts(
+                full_seq[best_c:best_c + overlap_length], placed_kmers,
+            )
         return best_c, best_s, best_n
 
     best_cut, best_score, conflicts = _search(min(base_shift, widen_cap))

@@ -1,23 +1,28 @@
-import type { OligoData } from "./types";
+export interface GBlockDetail {
+  index: number;
+  label: string;
+  start: number;
+  end: number;
+  length: number;
+  gc: number;
+  seq: string;
+}
 
 interface Props {
-  oligo: OligoData;
+  gblock: GBlockDetail;
   onClose: () => void;
 }
 
-export default function OligoDetailPanel({ oligo, onClose }: Props) {
+export default function GBlockDetailPanel({ gblock, onClose }: Props) {
   return (
     <div className="mt-3 bg-white border border-[#dadce0] p-4">
       <div className="flex items-center justify-between mb-3">
         <h3 className="font-medium text-[#202124]">
-          Oligo {oligo.index}
-          <span
-            className={`ml-2 text-sm ${
-              oligo.strand === "sense" ? "text-[#1a73e8]" : "text-[#e8710a]"
-            }`}
-          >
-            {oligo.strand === "sense" ? "sense (5'-3')" : "antisense (3'-5')"}
-          </span>
+          gBlock G{gblock.index + 1}
+          {gblock.label && (
+            <span className="ml-2 text-sm text-[#5f6368]">({gblock.label})</span>
+          )}
+          <span className="ml-2 text-sm text-[#34a853]">double-stranded</span>
         </h3>
         <button
           onClick={onClose}
@@ -27,45 +32,33 @@ export default function OligoDetailPanel({ oligo, onClose }: Props) {
         </button>
       </div>
 
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-3 text-sm mb-3 text-[#202124]">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm mb-3 text-[#202124]">
         <div>
           <span className="text-[#5f6368] block">
             Position <span className="text-xs text-[#9aa0a6]">(nt, 1-indexed)</span>
           </span>
-          {oligo.start + 1} - {oligo.end}
+          {gblock.start + 1} - {gblock.end}
         </div>
         <div>
           <span className="text-[#5f6368] block">Length</span>
-          {oligo.length} bp
+          {gblock.length} bp
         </div>
         <div>
           <span className="text-[#5f6368] block">GC Content</span>
-          {(oligo.gc * 100).toFixed(1)}%
-        </div>
-        <div>
-          <span className="text-[#5f6368] block">Role</span>
-          {oligo.is_first
-            ? "First (has upstream flank)"
-            : oligo.is_last
-            ? "Last (has downstream flank)"
-            : "Internal"}
+          {(gblock.gc * 100).toFixed(1)}%
         </div>
         <div>
           <span className="text-[#5f6368] block">Order as</span>
-          {oligo.length <= 45
-            ? "Standard oligo"
-            : oligo.length <= 60
-            ? "Extended oligo"
-            : "200-mer / gBlock"}
+          gBlock / synthetic fragment
         </div>
       </div>
 
       <div>
         <span className="text-[#5f6368] text-sm block mb-1">
-          Sequence (5&apos;-3&apos; as ordered)
+          Sequence (5&apos;-3&apos;)
         </span>
         <div className="font-mono text-xs bg-[#f8f9fa] border border-[#dadce0] p-3 break-all select-all text-[#202124]">
-          {oligo.seq}
+          {gblock.seq}
         </div>
       </div>
     </div>

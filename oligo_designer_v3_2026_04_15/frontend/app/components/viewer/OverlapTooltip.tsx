@@ -22,8 +22,10 @@ export default function OverlapTooltip({ overlap, onClose }: Props) {
       <table className="text-sm mb-3">
         <tbody>
           <tr>
-            <td className="text-[#5f6368] pr-6 py-0.5">Position</td>
-            <td className="py-0.5">{overlap.start}-{overlap.end}</td>
+            <td className="text-[#5f6368] pr-6 py-0.5">
+              Position <span className="text-xs text-[#9aa0a6]">(nt, 1-indexed)</span>
+            </td>
+            <td className="py-0.5">{overlap.start + 1}-{overlap.end}</td>
           </tr>
           <tr>
             <td className="text-[#5f6368] pr-6 py-0.5">GC</td>

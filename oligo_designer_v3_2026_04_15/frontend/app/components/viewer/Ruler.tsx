@@ -17,8 +17,13 @@ export default function Ruler({ totalLength, bp2x, containerWidth, pxPerBp, y }:
     : viewBp <= 5000 ? 500
     : 1000;
 
-  const ticks: number[] = [];
-  for (let t = 0; t <= totalLength; t += tickInterval) ticks.push(t);
+  // Ticks are rendered at 1-indexed biology positions (1, 100, 200, ...,
+  // totalLength) to match the 1-indexed convention used throughout the
+  // rest of the UI. SVG x-coordinates still come from the 0-indexed
+  // internal representation: 1-indexed position P sits at bp2x(P - 1).
+  const ticks: number[] = [1];
+  for (let p = tickInterval; p < totalLength; p += tickInterval) ticks.push(p);
+  if (ticks[ticks.length - 1] !== totalLength) ticks.push(totalLength);
 
   return (
     <g>
@@ -30,24 +35,24 @@ export default function Ruler({ totalLength, bp2x, containerWidth, pxPerBp, y }:
         stroke="#dadce0"
         strokeWidth={1}
       />
-      {ticks.map((t) => (
-        <g key={`tick-${t}`}>
+      {ticks.map((p) => (
+        <g key={`tick-${p}`}>
           <line
-            x1={bp2x(t)}
+            x1={bp2x(p - 1)}
             y1={y - 4}
-            x2={bp2x(t)}
+            x2={bp2x(p - 1)}
             y2={y + 4}
             stroke="#80868b"
             strokeWidth={1}
           />
           <text
-            x={bp2x(t)}
+            x={bp2x(p - 1)}
             y={y - 8}
             textAnchor="middle"
             fill="#5f6368"
             fontSize={10}
           >
-            {t}
+            {p}
           </text>
         </g>
       ))}

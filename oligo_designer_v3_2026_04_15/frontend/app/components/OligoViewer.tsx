@@ -11,6 +11,7 @@ import OligoArrow from "./viewer/OligoArrow";
 import OverlapRegion from "./viewer/OverlapRegion";
 import OverlapTooltip from "./viewer/OverlapTooltip";
 import OligoDetailPanel from "./viewer/OligoDetailPanel";
+import GBlockDetailPanel from "./viewer/GBlockDetailPanel";
 import { ISSUE_COLORS } from "./viewer/colors";
 
 interface GBlockRegionView {
@@ -18,6 +19,12 @@ interface GBlockRegionView {
   end_bp: number;
   label: string;
   len_bp: number;
+  // Optional richer fields — if provided, clicking the gBlock opens a
+  // detail panel (same UX as oligos/overlaps). When missing, the gBlock
+  // renders but is not selectable.
+  index?: number;
+  seq?: string;
+  gc?: number;
 }
 
 interface Props {
@@ -27,6 +34,11 @@ interface Props {
   sequenceIssues: SequenceIssue[];
   gblockRegions?: GBlockRegionView[];
   fullSequence?: string;
+  // Insert boundaries within the full construct (full = upstream + insert + downstream).
+  // [0, insertStart) and [insertEnd, totalLength) are plasmid flanks.
+  // Defaults to the entire construct being insert (no flanks) for back-compat.
+  insertStart?: number;
+  insertEnd?: number;
 }
 
 const MIN_PX_PER_BP = 0.3;
@@ -37,7 +49,24 @@ const GBLOCK_COLOR = "#00897b";        // teal — distinct from blue (sense), o
 const GBLOCK_FILL = "#e0f2f1";        // light teal for base-visible mode
 const GBLOCK_FILL_SOLID = "#00897b";  // solid teal when zoomed out
 
-export default function OligoViewer({ oligos, overlaps, totalLength, sequenceIssues, gblockRegions, fullSequence }: Props) {
+// Plasmid flank styling — neutral gray so it reads as "fixed, not designed by us"
+const FLANK_FILL = "rgba(128, 134, 139, 0.12)";
+const FLANK_STROKE = "#80868b";
+const FLANK_LABEL_COLOR = "#5f6368";
+
+export default function OligoViewer({
+  oligos,
+  overlaps,
+  totalLength,
+  sequenceIssues,
+  gblockRegions,
+  fullSequence,
+  insertStart = 0,
+  insertEnd,
+}: Props) {
+  const effectiveInsertEnd = insertEnd ?? totalLength;
+  const hasUpstreamFlank = insertStart > 0;
+  const hasDownstreamFlank = effectiveInsertEnd < totalLength;
   const containerRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const initializedRef = useRef(false);
@@ -47,6 +76,7 @@ export default function OligoViewer({ oligos, overlaps, totalLength, sequenceIss
   const [selectedOligo, setSelectedOligo] = useState<OligoData | null>(null);
   const [selectedOverlap, setSelectedOverlap] = useState<OverlapData | null>(null);
   const [selectedIssueIndex, setSelectedIssueIndex] = useState<number | null>(null);
+  const [selectedGblockKey, setSelectedGblockKey] = useState<string | null>(null);
   const [isPanning, setIsPanning] = useState(false);
   const [panStart, setPanStart] = useState({ x: 0, scrollLeft: 0 });
   const [showIssues, setShowIssues] = useState(true);
@@ -55,15 +85,19 @@ export default function OligoViewer({ oligos, overlaps, totalLength, sequenceIss
   // Clear other selections when one is made
   function selectOligo(oligo: OligoData | null) {
     setSelectedOligo(oligo);
-    if (oligo) { setSelectedOverlap(null); setSelectedIssueIndex(null); }
+    if (oligo) { setSelectedOverlap(null); setSelectedIssueIndex(null); setSelectedGblockKey(null); }
   }
   function selectOverlap(overlap: OverlapData | null) {
     setSelectedOverlap(overlap);
-    if (overlap) { setSelectedOligo(null); setSelectedIssueIndex(null); }
+    if (overlap) { setSelectedOligo(null); setSelectedIssueIndex(null); setSelectedGblockKey(null); }
   }
   function selectIssue(index: number | null) {
     setSelectedIssueIndex(index);
-    if (index !== null) { setSelectedOligo(null); setSelectedOverlap(null); }
+    if (index !== null) { setSelectedOligo(null); setSelectedOverlap(null); setSelectedGblockKey(null); }
+  }
+  function selectGblock(key: string | null) {
+    setSelectedGblockKey(key);
+    if (key !== null) { setSelectedOligo(null); setSelectedOverlap(null); setSelectedIssueIndex(null); }
   }
 
   // --- Resize: set initial zoom once ---
@@ -410,6 +444,58 @@ export default function OligoViewer({ oligos, overlaps, totalLength, sequenceIss
               />
             )}
 
+            {/* Plasmid flank shading — drawn behind everything else */}
+            {(hasUpstreamFlank || hasDownstreamFlank) && (() => {
+              const sY = layout.SENSE_Y;
+              const aY = layout.ANTISENSE_Y;
+              const oH = layout.OLIGO_H;
+              const top = sY - 4;
+              const bot = aY + oH + 4;
+              const h = bot - top;
+              const showLabel = pxPerBp >= 0.6;
+              const flanks: { start: number; end: number; label: string; anchor: "start" | "end" }[] = [];
+              if (hasUpstreamFlank) {
+                flanks.push({ start: 0, end: insertStart, label: "upstream plasmid flank", anchor: "start" });
+              }
+              if (hasDownstreamFlank) {
+                flanks.push({ start: effectiveInsertEnd, end: totalLength, label: "downstream plasmid flank", anchor: "end" });
+              }
+              return flanks.map((f, i) => {
+                const x = bp2x(f.start);
+                const w = Math.max(bp2x(f.end) - x, 1);
+                const labelX = f.anchor === "start" ? x + 4 : x + w - 4;
+                const textAnchor = f.anchor === "start" ? "start" : "end";
+                return (
+                  <g key={`flank-${i}`}>
+                    <rect
+                      x={x}
+                      y={top}
+                      width={w}
+                      height={h}
+                      fill={FLANK_FILL}
+                      stroke={FLANK_STROKE}
+                      strokeWidth={0.5}
+                      strokeDasharray="3 2"
+                      style={{ pointerEvents: "none" }}
+                    />
+                    {showLabel && w >= 40 && (
+                      <text
+                        x={labelX}
+                        y={top - 2}
+                        textAnchor={textAnchor}
+                        fontSize={9}
+                        fill={FLANK_LABEL_COLOR}
+                        fontStyle="italic"
+                        style={{ pointerEvents: "none" }}
+                      >
+                        {f.label} ({f.end - f.start} bp)
+                      </text>
+                    )}
+                  </g>
+                );
+              });
+            })()}
+
             {/* gBlock regions — double-stranded, styled like oligos */}
             {(gblockRegions ?? []).map((gb, i) => {
               const x = bp2x(gb.start_bp);
@@ -417,9 +503,12 @@ export default function OligoViewer({ oligos, overlaps, totalLength, sequenceIss
               const sY = layout.SENSE_Y;
               const aY = layout.ANTISENSE_Y;
               const oH = layout.OLIGO_H;
+              const gbKey = `${gb.start_bp}-${gb.end_bp}`;
+              const isSelected = selectedGblockKey === gbKey;
+              const selectable = gb.seq !== undefined && gb.gc !== undefined && gb.index !== undefined;
               const fill = showBases ? GBLOCK_FILL : GBLOCK_FILL_SOLID;
-              const stroke = showBases ? GBLOCK_COLOR : "#ffffff";
-              const strokeW = showBases ? 1 : 1;
+              const stroke = isSelected ? "#202124" : showBases ? GBLOCK_COLOR : "#ffffff";
+              const strokeW = isSelected ? 1.5 : 1;
 
               // Render bases for one strand
               const renderStrandBases = (yPos: number, isComplement: boolean) => {
@@ -447,7 +536,14 @@ export default function OligoViewer({ oligos, overlaps, totalLength, sequenceIss
               };
 
               return (
-                <g key={`gblock-asm-${i}`}>
+                <g
+                  key={`gblock-asm-${i}`}
+                  onClick={selectable ? (e) => {
+                    e.stopPropagation();
+                    selectGblock(isSelected ? null : gbKey);
+                  } : undefined}
+                  style={selectable ? { cursor: "pointer" } : undefined}
+                >
                   {/* Sense strand bar */}
                   <rect
                     x={x} y={sY} width={w} height={oH}
@@ -465,8 +561,8 @@ export default function OligoViewer({ oligos, overlaps, totalLength, sequenceIss
                     opacity={showBases ? 1 : 0.85}
                   />
                   {/* Connecting side bars */}
-                  <line x1={x} y1={sY + oH} x2={x} y2={aY} stroke={showBases ? GBLOCK_COLOR : "#ffffff"} strokeWidth={1} />
-                  <line x1={x + w} y1={sY + oH} x2={x + w} y2={aY} stroke={showBases ? GBLOCK_COLOR : "#ffffff"} strokeWidth={1} />
+                  <line x1={x} y1={sY + oH} x2={x} y2={aY} stroke={isSelected ? "#202124" : showBases ? GBLOCK_COLOR : "#ffffff"} strokeWidth={isSelected ? 1.5 : 1} />
+                  <line x1={x + w} y1={sY + oH} x2={x + w} y2={aY} stroke={isSelected ? "#202124" : showBases ? GBLOCK_COLOR : "#ffffff"} strokeWidth={isSelected ? 1.5 : 1} />
 
                   {showBases ? (
                     <>
@@ -534,8 +630,9 @@ export default function OligoViewer({ oligos, overlaps, totalLength, sequenceIss
               />
             ))}
 
-            {/* Amino acid translation track */}
-            {showAA && fullSeq.length >= 3 && (() => {
+            {/* Amino acid translation track — frame anchored to the insert,
+                not to position 0, so the upstream flank doesn't shift the frame. */}
+            {showAA && fullSeq.length - insertStart >= 3 && (() => {
               const codonTable: Record<string, string> = {
                 TTT:"F",TTC:"F",TTA:"L",TTG:"L",CTT:"L",CTC:"L",CTA:"L",CTG:"L",
                 ATT:"I",ATC:"I",ATA:"I",ATG:"M",GTT:"V",GTC:"V",GTA:"V",GTG:"V",
@@ -547,7 +644,7 @@ export default function OligoViewer({ oligos, overlaps, totalLength, sequenceIss
                 AGT:"S",AGC:"S",AGA:"R",AGG:"R",GGT:"G",GGC:"G",GGA:"G",GGG:"G",
               };
               const aas = [];
-              for (let i = 0; i + 2 < fullSeq.length; i += 3) {
+              for (let i = insertStart; i + 2 < fullSeq.length && i + 2 < effectiveInsertEnd; i += 3) {
                 const codon = fullSeq.slice(i, i + 3).toUpperCase();
                 const aa = codonTable[codon] || "?";
                 const x = bp2x(i) + bp2x(3) / 2;
@@ -623,6 +720,30 @@ export default function OligoViewer({ oligos, overlaps, totalLength, sequenceIss
         <OligoDetailPanel oligo={selectedOligo} onClose={() => setSelectedOligo(null)} />
       )}
 
+      {/* Selected gBlock detail */}
+      {selectedGblockKey && (() => {
+        const gb = (gblockRegions ?? []).find(
+          (g) => `${g.start_bp}-${g.end_bp}` === selectedGblockKey
+        );
+        if (!gb || gb.seq === undefined || gb.gc === undefined || gb.index === undefined) {
+          return null;
+        }
+        return (
+          <GBlockDetailPanel
+            gblock={{
+              index: gb.index,
+              label: gb.label,
+              start: gb.start_bp,
+              end: gb.end_bp,
+              length: gb.len_bp,
+              gc: gb.gc,
+              seq: gb.seq,
+            }}
+            onClose={() => setSelectedGblockKey(null)}
+          />
+        );
+      })()}
+
       {/* Selected issue detail */}
       {selectedIssue && (() => {
         const rawType = selectedIssue.type.replace(/^overlap_/, "");
@@ -653,8 +774,10 @@ export default function OligoViewer({ oligos, overlaps, totalLength, sequenceIss
               <tbody>
                 {selectedIssue.start !== undefined && (
                   <tr>
-                    <td className="text-[#5f6368] pr-6 py-0.5 align-top">Position</td>
-                    <td className="py-0.5">{selectedIssue.start}-{selectedIssue.end}</td>
+                    <td className="text-[#5f6368] pr-6 py-0.5 align-top">
+                      Position <span className="text-xs text-[#9aa0a6]">(nt, 1-indexed)</span>
+                    </td>
+                    <td className="py-0.5">{selectedIssue.start + 1}-{selectedIssue.end ?? selectedIssue.start + 1}</td>
                   </tr>
                 )}
                 <tr>

@@ -10,7 +10,7 @@ import os
 sys.path.insert(0, os.path.dirname(__file__))
 
 from oligo_designer import (
-    tile_sequence, reverse_complement, design_oligos,
+    tile_sequence, tile_sequence_with_gblocks, reverse_complement, design_oligos,
     find_homopolymers, find_g_quadruplex, find_repeats,
     gc_content, check_overlap, Overlap, scan_sequence_complexity,
 )
@@ -195,11 +195,114 @@ def test_different_oligo_lengths():
     oligos, overlaps = tile_sequence(TEST_SEQ_500, oligo_length=60, overlap_length=20)
     assembled = assemble_in_silico(oligos, TEST_SEQ_500)
     assert assembled == TEST_SEQ_500
-    assert all(o.length <= 80 for o in oligos), "No oligo should be unreasonably long"
+    # HARD MAX: no oligo may exceed the user-specified oligo_length. This is
+    # an IDT pricing-tier constraint — going over bumps the order to a more
+    # expensive bracket.
+    over = [o for o in oligos if o.length > 60]
+    assert not over, (
+        f"Oligo length cap violated. Got "
+        f"{[(o.index, o.length) for o in over]}; cap = 60"
+    )
     # Should need fewer oligos with longer oligos
     oligos_short, _ = tile_sequence(TEST_SEQ_500, oligo_length=45, overlap_length=20)
+    assert all(o.length <= 45 for o in oligos_short), "45bp cap should hold"
     assert len(oligos) < len(oligos_short), "60bp oligos should need fewer total"
     print(f"  PASS: different_oligo_lengths (60bp: {len(oligos)} oligos vs 45bp: {len(oligos_short)} oligos)")
+
+
+def test_oligo_length_hard_cap():
+    """Across many lengths, no oligo should ever exceed the user-set cap."""
+    for oligo_len in [40, 45, 50, 60, 80, 100]:
+        oligos, _ = tile_sequence(TEST_SEQ_500, oligo_length=oligo_len, overlap_length=20)
+        over = [o for o in oligos if o.length > oligo_len]
+        assert not over, (
+            f"oligo_length={oligo_len}: violations "
+            f"{[(o.index, o.length) for o in over]}"
+        )
+        # Round-trip assembly still works (we didn't break tiling).
+        assembled = assemble_in_silico(oligos, TEST_SEQ_500)
+        assert assembled == TEST_SEQ_500, f"oligo_length={oligo_len}: assembly broken"
+    print(f"  PASS: oligo_length_hard_cap (40,45,50,60,80,100)")
+
+
+def test_gblock_tiling_covers_plasmid_flanks():
+    """Regression: with plasmid flanks present, oligos must cover the
+    full construct (upstream + insert + downstream) — positions emitted
+    in full_seq coordinates, not insert-relative. Previously
+    tile_sequence_with_gblocks subtracted insert_start from all
+    positions, which shifted everything left so the downstream flank
+    was never tiled.
+    """
+    upstream = "AAGCTTGCCACCATGGGATGG"     # 21bp
+    downstream = "TAAGGATCCGCGGCCGCCTC"    # 20bp
+    insert = "ATG" + ("ACGTACGT" * 88) + "TAA"  # 710bp
+    total_len = len(upstream) + len(insert) + len(downstream)
+
+    gblocks = [(64, 191, "G1"), (324, 451, "G2")]
+    oligos, overlaps, gfrag = tile_sequence_with_gblocks(
+        insert, gblock_regions=gblocks, oligo_length=60, overlap_length=20,
+        plasmid_upstream=upstream, plasmid_downstream=downstream,
+    )
+
+    assert oligos[0].start == 0, (
+        f"First oligo should start at 0 (beginning of upstream flank), "
+        f"got {oligos[0].start}"
+    )
+    assert oligos[-1].end == total_len, (
+        f"Last oligo should end at full_seq length {total_len} "
+        f"(end of downstream flank), got {oligos[-1].end}"
+    )
+    # All positions must be non-negative and within full_seq.
+    for o in oligos:
+        assert 0 <= o.start < o.end <= total_len, (
+            f"Oligo {o.index} has out-of-range coords: {o.start}-{o.end} "
+            f"(full_seq is [0, {total_len}))"
+        )
+    for g in gfrag:
+        assert 0 <= g.start < g.end <= total_len, (
+            f"gBlock G{g.index+1} has out-of-range coords: {g.start}-{g.end}"
+        )
+    print(f"  PASS: gblock_tiling_covers_plasmid_flanks")
+
+
+def test_gblock_extension_respects_oligo_length():
+    """Regression: an oligo next to a gBlock must not exceed oligo_length
+    after being extended into the gBlock for Gibson overlap.
+
+    Scenario mirrors a real case from the codon-optimized GLP-1 construct:
+    a gBlock followed by a region whose natural tiling produces a 60bp
+    oligo that, once extended 20bp backward into the gBlock, would have
+    been 80bp. The tiler should instead split the region into more oligos
+    so no single oligo exceeds the cap.
+    """
+    # Arbitrary deterministic sequence; content doesn't matter for the
+    # length check.
+    seq = (TEST_SEQ_500 * 2)[:600]
+    # Place gBlocks so the bridge-oligo scenario triggers.
+    gblocks = [
+        (64, 191, "G1"),   # 127bp — same gBlock span as in the bug report
+        (324, 451, "G2"),  # second gBlock further along
+    ]
+    oligos, overlaps, gblock_frags = tile_sequence_with_gblocks(
+        seq, gblock_regions=gblocks, oligo_length=60, overlap_length=20,
+    )
+    over = [(o.index, o.length) for o in oligos if o.length > 60]
+    assert not over, (
+        f"Oligo length cap violated with gBlocks. "
+        f"Got {over}; cap = 60"
+    )
+    # Sweep caps from the minimum feasible (= 2*overlap, the "pure
+    # bridge oligo" size) up through larger values.
+    for oligo_len in [40, 50, 60, 80, 100, 120]:
+        olg, _, _ = tile_sequence_with_gblocks(
+            seq, gblock_regions=gblocks,
+            oligo_length=oligo_len, overlap_length=20,
+        )
+        over = [(o.index, o.length) for o in olg if o.length > oligo_len]
+        assert not over, (
+            f"oligo_length={oligo_len} with gBlocks: violations {over}"
+        )
+    print(f"  PASS: gblock_extension_respects_oligo_length")
 
 
 def test_all_overlaps_correct_length():
@@ -223,5 +326,8 @@ if __name__ == "__main__":
     test_polyg_detection()
     test_cross_hybridization()
     test_different_oligo_lengths()
+    test_oligo_length_hard_cap()
+    test_gblock_tiling_covers_plasmid_flanks()
+    test_gblock_extension_respects_oligo_length()
     test_all_overlaps_correct_length()
     print("\nAll tests passed!")

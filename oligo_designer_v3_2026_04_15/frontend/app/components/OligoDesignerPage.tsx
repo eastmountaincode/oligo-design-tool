@@ -6,6 +6,13 @@ import { ISSUE_COLORS } from "./viewer/colors";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
+// Example plasmid flanks for the pcDNA3.1(+) MCS, between HindIII and XhoI
+// (the most common insertion window for mammalian expression). The first
+// oligo will overlap into HindIII; the last oligo into XhoI — the Gibson
+// overlap case Slim described in the 2026-04-07 meeting.
+const PCDNA3_UPSTREAM = "AAGCTTGGTACCGAGCTCGG";
+const PCDNA3_DOWNSTREAM = "CTCGAGTCTAGAGGGCCCGT";
+
 interface OligoResult {
   index: number;
   seq: string;
@@ -187,6 +194,29 @@ export default function OligoDesignerPage({ liveDna, liveGblocks }: OligoDesigne
           <summary className="cursor-pointer text-[#5f6368] hover:text-[#202124]">
             Plasmid flanking sequences (optional)
           </summary>
+          <div className="flex items-center gap-3 text-xs mt-2">
+            <span className="text-[#5f6368]">Examples:</span>
+            <button
+              type="button"
+              onClick={() => {
+                setUpstream(PCDNA3_UPSTREAM);
+                setDownstream(PCDNA3_DOWNSTREAM);
+              }}
+              className="text-[#1a73e8] hover:text-[#1967d2] cursor-pointer"
+            >
+              pcDNA3.1 (HindIII / XhoI)
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setUpstream("");
+                setDownstream("");
+              }}
+              className="text-[#5f6368] hover:text-[#202124] cursor-pointer"
+            >
+              clear
+            </button>
+          </div>
           <div className="grid grid-cols-2 gap-4 mt-2">
             <div>
               <label className="block text-sm font-medium mb-1 text-[#202124]">
@@ -368,8 +398,13 @@ export default function OligoDesignerPage({ liveDna, liveGblocks }: OligoDesigne
               end_bp: g.end,
               label: g.label,
               len_bp: g.length,
+              index: g.index,
+              seq: g.seq,
+              gc: g.gc,
             }))}
-            fullSequence={sequence}
+            fullSequence={(upstream || "").toUpperCase() + sequence + (downstream || "").toUpperCase()}
+            insertStart={(upstream || "").length}
+            insertEnd={(upstream || "").length + sequence.length}
           />
 
           {/* Issue legend */}
@@ -455,7 +490,10 @@ export default function OligoDesignerPage({ liveDna, liveGblocks }: OligoDesigne
                 <tr className="text-left text-[#5f6368] border-b border-[#dadce0]">
                   <th className="px-4 py-2">#</th>
                   <th className="px-4 py-2">Type</th>
-                  <th className="px-4 py-2">Position</th>
+                  <th className="px-4 py-2">
+                    Position
+                    <span className="ml-1 text-xs text-[#9aa0a6] font-normal">(nt, 1-indexed)</span>
+                  </th>
                   <th className="px-4 py-2">Length</th>
                   <th className="px-4 py-2">GC%</th>
                   <th className="px-4 py-2">Sequence</th>
@@ -482,12 +520,12 @@ export default function OligoDesignerPage({ liveDna, liveGblocks }: OligoDesigne
                             <span className="text-[#34a853] font-medium">gBlock</span>
                           </td>
                           <td className="px-4 py-2 text-[#5f6368]">
-                            {g.start}-{g.end}
+                            {g.start + 1}-{g.end}
                           </td>
                           <td className="px-4 py-2">{g.length}</td>
                           <td className="px-4 py-2">{(g.gc * 100).toFixed(0)}%</td>
                           <td className="px-4 py-2 font-mono text-xs break-all">
-                            {g.seq.length > 120 ? g.seq.slice(0, 60) + "..." + g.seq.slice(-60) : g.seq}
+                            {g.seq}
                           </td>
                         </tr>
                       );
@@ -511,7 +549,7 @@ export default function OligoDesignerPage({ liveDna, liveGblocks }: OligoDesigne
                           </span>
                         </td>
                         <td className="px-4 py-2 text-[#5f6368]">
-                          {o.start}-{o.end}
+                          {o.start + 1}-{o.end}
                         </td>
                         <td className="px-4 py-2">{o.length}</td>
                         <td className="px-4 py-2">{(o.gc * 100).toFixed(0)}%</td>
@@ -532,7 +570,10 @@ export default function OligoDesignerPage({ liveDna, liveGblocks }: OligoDesigne
               <thead>
                 <tr className="text-left text-[#5f6368] border-b border-[#dadce0]">
                   <th className="px-4 py-2">#</th>
-                  <th className="px-4 py-2">Position</th>
+                  <th className="px-4 py-2">
+                    Position
+                    <span className="ml-1 text-xs text-[#9aa0a6] font-normal">(nt, 1-indexed)</span>
+                  </th>
                   <th className="px-4 py-2">GC%</th>
                   <th className="px-4 py-2">Tm</th>
                   <th className="px-4 py-2">Sequence</th>
@@ -551,7 +592,7 @@ export default function OligoDesignerPage({ liveDna, liveGblocks }: OligoDesigne
                   >
                     <td className="px-4 py-2">{o.index}</td>
                     <td className="px-4 py-2 text-[#5f6368]">
-                      {o.start}-{o.end}
+                      {o.start + 1}-{o.end}
                     </td>
                     <td className="px-4 py-2">{(o.gc * 100).toFixed(0)}%</td>
                     <td className="px-4 py-2">
