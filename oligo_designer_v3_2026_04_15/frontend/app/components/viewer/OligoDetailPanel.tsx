@@ -1,4 +1,4 @@
-import type { OligoData } from "./types";
+import { oligoLabel, type OligoData } from "./types";
 
 interface Props {
   oligo: OligoData;
@@ -10,7 +10,7 @@ export default function OligoDetailPanel({ oligo, onClose }: Props) {
     <div className="mt-3 bg-white border border-[#dadce0] p-4">
       <div className="flex items-center justify-between mb-3">
         <h3 className="font-medium text-[#202124]">
-          Oligo {oligo.index}
+          Oligo {oligoLabel(oligo)}
           <span
             className={`ml-2 text-sm ${
               oligo.strand === "sense" ? "text-[#1a73e8]" : "text-[#e8710a]"

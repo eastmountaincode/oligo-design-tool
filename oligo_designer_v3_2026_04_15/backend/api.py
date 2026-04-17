@@ -31,7 +31,7 @@ if CUSTOM_TABLES_DIR.exists():
         CUSTOM_TABLES[f.stem] = f.read_text()
 from oligo_designer import (
     tile_sequence, tile_sequence_with_gblocks, scan_sequence_complexity,
-    gc_content, design_oligos, ReactionConditions, GBlockFragment,
+    gc_content, ReactionConditions,
 )
 
 app = FastAPI(title="Oligo Designer", version="1.0")
@@ -48,6 +48,27 @@ app.add_middleware(
 # Oligo design endpoint
 # ---------------------------------------------------------------------------
 
+class RepairContext(BaseModel):
+    """Codon-optimization context needed to run the cross-hyb repair pass.
+
+    When the frontend has just codon-optimized a sequence it knows all the
+    inputs the beam used (protein, codon table, constraint settings). Passing
+    those through to /api/design lets us run a third pass that swaps
+    individual codons to resolve cross-hybridization that only becomes
+    visible after tiling. All fields are optional; when any required piece
+    (protein, codon_table) is missing, repair is skipped.
+    """
+    protein: str = Field("", description="Protein sequence the DNA was optimized against")
+    codon_table: list[dict] = Field(default_factory=list, description="List of {amino_acid, codon, per_thousand} entries")
+    min_codon_frequency: float = Field(10.0, ge=0.0, le=100.0, description="Per-thousand floor for eligible synonyms")
+    gc_min: float = Field(0.25, ge=0.0, le=1.0)
+    gc_max: float = Field(0.75, ge=0.0, le=1.0)
+    gc_window: int = Field(50, ge=20, le=200)
+    avoid_homopolymers_gc: int = Field(4, ge=3, le=8)
+    avoid_homopolymers_at: int = Field(6, ge=3, le=8)
+    avoid_patterns: list[str] = Field(default_factory=list)
+
+
 class DesignRequest(BaseModel):
     sequence: str = Field(..., description="DNA sequence (ATCGs only)")
     max_oligo_length: int = Field(60, ge=30, le=200)
@@ -60,6 +81,15 @@ class DesignRequest(BaseModel):
     dna_conc: float = Field(250.0, description="Oligo concentration in nM")
     annealing_temp: float = Field(50.0, description="Annealing temperature in °C")
     gblock_regions: list[dict] = Field(default_factory=list, description="gBlock regions [{start_bp, end_bp, label}]")
+    repair_context: RepairContext | None = Field(None, description="If set, run cross-hyb repair after tiling")
+    # Multi-reaction assembly: N-1 split points (in INSERT bp coords, ascending,
+    # codon-aligned, not inside any gBlock) partition the insert into N
+    # independent Gibson reactions. The monolithic codon optimization is still
+    # the source of truth for the DNA sequence; splits only change how the
+    # insert gets tiled. Each reaction gets junction flanks so that adjacent
+    # reactions' products anneal at a second Gibson. Empty list == 1 reaction
+    # (the legacy path).
+    splits: list[int] = Field(default_factory=list, description="Insert-bp split positions for multi-reaction assembly")
 
 
 class OligoOut(BaseModel):
@@ -95,17 +125,68 @@ class GBlockOut(BaseModel):
     fragment_type: str = "gblock"
 
 
-class DesignResponse(BaseModel):
-    insert_length: int
-    total_length: int
+class RepairLogEntryOut(BaseModel):
+    iteration: int
+    kind: str                         # "applied" | "no_move_found" | "skipped"
+    codon_index: int | None = None
+    insert_position: int | None = None
+    amino_acid: str | None = None
+    old_codon: str | None = None
+    new_codon: str | None = None
+    old_freq_per_k: float | None = None
+    new_freq_per_k: float | None = None
+    gc_before: float | None = None
+    gc_after: float | None = None
+    fixed_pairs: list[list[int]] = []
+    remaining_pairs: list[list[int]] = []
+    remaining_max_tm: float | None = None
+    threshold_tm: float | None = None
+    notes: str = ""
+
+
+class RepairReport(BaseModel):
+    ran: bool
+    threshold_tm: float | None = None
+    issues_before: int = 0
+    issues_after: int = 0
+    log: list[RepairLogEntryOut] = []
+    modified_dna: str | None = None      # insert DNA after repair (if it changed)
+    skipped_reason: str | None = None    # when ran=False
+
+
+class ReactionResult(BaseModel):
+    """One physical Gibson reaction. When `splits` is empty, a response has
+    exactly one reaction that spans the whole insert with plasmid flanks.
+    When there are N-1 splits, there are N reactions, each with a mix of
+    plasmid and junction flanks. Oligo/overlap/gBlock positions are reported
+    in GLOBAL full-construct coordinates (plasmid_upstream + insert +
+    plasmid_downstream) so a single assembly viewer can render all
+    reactions on one ruler."""
+    index: int                        # 0-based reaction index
+    insert_start: int                 # segment's start in INSERT bp coords (inclusive)
+    insert_end: int                   # segment's end in INSERT bp coords (exclusive)
+    left_flank: str                   # DNA sitting 5' of this segment during tiling
+    right_flank: str                  # DNA sitting 3' of this segment during tiling
+    left_is_junction: bool            # True if left flank comes from the previous reaction (not plasmid)
+    right_is_junction: bool           # True if right flank goes into the next reaction (not plasmid)
     num_oligos: int
     num_overlaps: int
     avg_overlap_tm: float | None
-    oligos: list[OligoOut]
-    overlaps: list[OverlapOut]
-    gblocks: list[GBlockOut] = []
+    oligos: list[OligoOut]            # positions in GLOBAL full-construct coords
+    overlaps: list[OverlapOut]        # positions in GLOBAL full-construct coords
+    gblocks: list[GBlockOut] = []     # positions in GLOBAL full-construct coords
+    repair: RepairReport = RepairReport(ran=False)
+
+
+class DesignResponse(BaseModel):
+    insert_length: int
+    total_length: int
+    num_oligos: int                   # sum across reactions
+    num_overlaps: int                 # sum across reactions
+    avg_overlap_tm: float | None      # mean across all reaction overlaps (unweighted)
     sequence_issues: list[dict]
     report_text: str
+    reactions: list[ReactionResult]
 
 
 @app.post("/api/design", response_model=DesignResponse)
@@ -126,82 +207,356 @@ def design(req: DesignRequest):
 
     gbs = sorted(req.gblock_regions, key=lambda g: g.get("start_bp", 0)) if req.gblock_regions else []
 
-    if not gbs:
-        oligos, overlaps = tile_sequence(
-            seq, max_oligo_length=req.max_oligo_length, overlap_length=req.overlap_length,
-            plasmid_upstream=req.plasmid_upstream, plasmid_downstream=req.plasmid_downstream,
-            conditions=conditions,
-        )
-        report = design_oligos(
-            seq, max_oligo_length=req.max_oligo_length, overlap_length=req.overlap_length,
-            plasmid_upstream=req.plasmid_upstream, plasmid_downstream=req.plasmid_downstream,
-            conditions=conditions,
-        )
-        gblock_frags: list[GBlockFragment] = []
-    else:
-        gb_tuples = [(g.get("start_bp", 0), g.get("end_bp", 0), g.get("label", ""))
-                     for g in gbs]
-        oligos, overlaps, gblock_frags = tile_sequence_with_gblocks(
-            seq,
-            gblock_regions=gb_tuples,
-            max_oligo_length=req.max_oligo_length,
-            overlap_length=req.overlap_length,
-            plasmid_upstream=req.plasmid_upstream,
-            plasmid_downstream=req.plasmid_downstream,
-            conditions=conditions,
-        )
-        report = f"Designed {len(oligos)} oligos + {len(gblock_frags)} gBlock(s)"
+    # ---- Validate splits and build reaction segment boundaries. ----
+    #
+    # splits is a list of INSERT-bp positions (strictly ascending); they
+    # partition the insert into N = len(splits)+1 segments, each processed as
+    # an independent Gibson reaction. Rules enforced here:
+    #   - every split is in (0, len(seq)) exclusive
+    #   - every split is codon-aligned (multiple of 3)
+    #   - every split avoids bisecting any gBlock (strictly outside [gs, ge))
+    #   - every split is at least `overlap_length` from each insert edge (so
+    #     the junction flanks can be cut from real insert DNA, not from
+    #     plasmid territory)
+    #   - consecutive splits are far enough apart that the reaction between
+    #     them can host at least one non-trivial oligo
+    splits = sorted(set(int(s) for s in req.splits))
+    L = req.overlap_length
+    min_seg_body = max(req.max_oligo_length, 3 * L)  # generous lower bound
+    for s in splits:
+        if not (0 < s < len(seq)):
+            raise HTTPException(400, f"Split at {s} is outside insert (0, {len(seq)}).")
+        if s % 3 != 0:
+            raise HTTPException(400, f"Split at {s} is not codon-aligned (must be a multiple of 3).")
+        if s < L or s > len(seq) - L:
+            raise HTTPException(400, f"Split at {s} is within {L} bp of an insert edge; junction flanks wouldn't fit.")
+        for g in gbs:
+            gs = int(g.get("start_bp", 0))
+            ge = int(g.get("end_bp", 0))
+            if gs < s < ge:
+                raise HTTPException(400, f"Split at {s} would bisect gBlock {gs}-{ge}.")
 
-    # Scan the FULL construct (upstream flank + insert + downstream flank) so
-    # issue coordinates match the full_seq coordinate system used by oligos,
-    # overlaps, and gBlocks. Scanning only `seq` would leave issue positions
-    # offset by `len(plasmid_upstream)` relative to what the frontend renders.
+    boundaries = [0] + splits + [len(seq)]
+    for k in range(len(boundaries) - 1):
+        seg_len = boundaries[k + 1] - boundaries[k]
+        if seg_len < min_seg_body:
+            raise HTTPException(400,
+                f"Reaction {k + 1} (insert {boundaries[k]}-{boundaries[k + 1]}, {seg_len} bp) "
+                f"is too short; each reaction needs at least {min_seg_body} bp of insert.")
+
+    # Global full-construct frame: plasmid_upstream + insert + plasmid_downstream.
+    # Oligo/overlap/gBlock positions are translated into this frame so the
+    # frontend can render all reactions on a single ruler.
+    construct_offset = len(req.plasmid_upstream)
+
+    reactions: list[ReactionResult] = []
+    all_overlap_tms: list[float] = []
+
+    for k in range(len(boundaries) - 1):
+        seg_start = boundaries[k]
+        seg_end = boundaries[k + 1]
+        segment_dna = seq[seg_start:seg_end]
+
+        left_is_junction = k > 0
+        right_is_junction = k < len(boundaries) - 2
+        left_flank = seq[seg_start - L:seg_start] if left_is_junction else req.plasmid_upstream
+        right_flank = seq[seg_end:seg_end + L] if right_is_junction else req.plasmid_downstream
+
+        # gBlocks fully contained in this segment, translated to segment-local insert coords.
+        seg_gbs = []
+        for g in gbs:
+            gs = int(g.get("start_bp", 0))
+            ge = int(g.get("end_bp", 0))
+            if seg_start <= gs and ge <= seg_end:
+                seg_gbs.append({
+                    "start_bp": gs - seg_start,
+                    "end_bp": ge - seg_start,
+                    "label": g.get("label", ""),
+                })
+
+        # Initial tile of this segment.
+        oligos, overlaps, gblock_frags = _tile_segment(
+            segment_dna, seg_gbs, left_flank, right_flank, conditions, req,
+        )
+
+        # Cross-hyb repair, per-reaction. The repair pass is FORBIDDEN from
+        # touching codons within `overlap_length` bp of any junction, because
+        # those bp are the shared junction DNA that also appears in the
+        # neighboring reaction's flank — modifying them would silently desync
+        # the two reactions. Plasmid-adjacent edges are repair-eligible
+        # normally (no neighbor to desync with).
+        repair_report = RepairReport(ran=False)
+        if _has_cross_hyb(overlaps) and req.repair_context \
+                and req.repair_context.protein and req.repair_context.codon_table:
+            # Junction-frozen ranges in segment-local insert coords.
+            frozen = list(seg_gbs)
+            if left_is_junction:
+                frozen.append({"start_bp": 0, "end_bp": L, "label": "__junction_left__"})
+            if right_is_junction:
+                frozen.append({
+                    "start_bp": len(segment_dna) - L,
+                    "end_bp": len(segment_dna),
+                    "label": "__junction_right__",
+                })
+            repair_report = _run_cross_hyb_repair_segment(
+                seg_dna=segment_dna,
+                seg_protein_start_aa=seg_start // 3,
+                seg_protein_end_aa=seg_end // 3,
+                overlaps=overlaps,
+                conditions=conditions,
+                req=req,
+                left_flank=left_flank,
+                right_flank=right_flank,
+                frozen_ranges=frozen,
+            )
+            if repair_report.modified_dna and repair_report.modified_dna != segment_dna:
+                # Re-tile the segment after repair so oligo strings / gBlock
+                # sequences / issue scans reflect the repaired DNA.
+                segment_dna = repair_report.modified_dna
+                oligos, overlaps, gblock_frags = _tile_segment(
+                    segment_dna, seg_gbs, left_flank, right_flank, conditions, req,
+                )
+
+        # Translate positions from reaction-local full_seq coords into the
+        # GLOBAL full-construct frame.
+        # Reaction-local full_seq = left_flank + segment_dna + right_flank.
+        # Reaction-local position 0 lies at construct-global offset:
+        if left_is_junction:
+            # left_flank is insert[seg_start - L : seg_start] which is
+            # construct-global (plasmid_upstream offset) + (seg_start - L).
+            global_offset = construct_offset + seg_start - L
+        else:
+            # left_flank is plasmid_upstream, which starts at construct offset 0.
+            global_offset = 0
+
+        final_oligos = [
+            OligoOut(
+                index=o.index, seq=o.seq,
+                start=o.start + global_offset, end=o.end + global_offset,
+                strand=o.strand, length=o.length,
+                is_first=o.is_first, is_last=o.is_last,
+                gc=round(gc_content(o.seq), 3),
+            )
+            for o in oligos
+        ]
+        final_overlaps = [
+            OverlapOut(
+                index=i + 1, seq=ovl.seq,
+                start=ovl.start + global_offset, end=ovl.end + global_offset,
+                gc=round(ovl.gc, 3),
+                tm=round(ovl.tm, 1) if ovl.tm is not None else None,
+                issues=[{"kind": iss.kind, "message": iss.message, "severity": iss.severity,
+                         "start": iss.start, "end": iss.end}
+                        for iss in ovl.issues],
+            )
+            for i, ovl in enumerate(overlaps)
+        ]
+        final_gblocks = [
+            GBlockOut(
+                index=gf.index, seq=gf.seq,
+                start=gf.start + global_offset, end=gf.end + global_offset,
+                length=gf.length, label=gf.label,
+                gc=round(gc_content(gf.seq), 3),
+            )
+            for gf in gblock_frags
+        ]
+
+        rxn_tms = [ovl.tm for ovl in final_overlaps if ovl.tm is not None]
+        all_overlap_tms.extend(rxn_tms)
+        reactions.append(ReactionResult(
+            index=k,
+            insert_start=seg_start,
+            insert_end=seg_end,
+            left_flank=left_flank,
+            right_flank=right_flank,
+            left_is_junction=left_is_junction,
+            right_is_junction=right_is_junction,
+            num_oligos=len(final_oligos),
+            num_overlaps=len(final_overlaps),
+            avg_overlap_tm=round(sum(rxn_tms) / len(rxn_tms), 1) if rxn_tms else None,
+            oligos=final_oligos,
+            overlaps=final_overlaps,
+            gblocks=final_gblocks,
+            repair=repair_report,
+        ))
+
+    # Global sequence scan (unchanged): runs on the full construct so issue
+    # coordinates match the full-construct frame used by all reactions' oligos.
     full_seq_for_scan = req.plasmid_upstream + seq + req.plasmid_downstream
     seq_issues = scan_sequence_complexity(full_seq_for_scan)
 
-    final_oligos = [
-        OligoOut(
-            index=o.index, seq=o.seq, start=o.start, end=o.end,
-            strand=o.strand, length=o.length,
-            is_first=o.is_first, is_last=o.is_last,
-            gc=round(gc_content(o.seq), 3),
-        )
-        for o in oligos
-    ]
-    final_overlaps = [
-        OverlapOut(
-            index=i + 1, seq=ovl.seq, start=ovl.start, end=ovl.end,
-            gc=round(ovl.gc, 3),
-            tm=round(ovl.tm, 1) if ovl.tm is not None else None,
-            issues=[{"kind": iss.kind, "message": iss.message, "severity": iss.severity,
-                     "start": iss.start, "end": iss.end}
-                    for iss in ovl.issues],
-        )
-        for i, ovl in enumerate(overlaps)
-    ]
-    gblock_outs = [
-        GBlockOut(
-            index=gf.index, seq=gf.seq, start=gf.start, end=gf.end,
-            length=gf.length, label=gf.label,
-            gc=round(gc_content(gf.seq), 3),
-        )
-        for gf in gblock_frags
-    ]
+    total_oligos = sum(r.num_oligos for r in reactions)
+    total_overlaps = sum(r.num_overlaps for r in reactions)
+    avg_tm = sum(all_overlap_tms) / len(all_overlap_tms) if all_overlap_tms else None
 
-    overlap_tms = [ovl.tm for ovl in final_overlaps if ovl.tm is not None]
-    avg_tm = sum(overlap_tms) / len(overlap_tms) if overlap_tms else None
+    if len(reactions) == 1:
+        report = f"Designed {total_oligos} oligos + {len(reactions[0].gblocks)} gBlock(s)"
+    else:
+        parts = [f"R{r.index + 1}: {r.num_oligos}o+{len(r.gblocks)}g" for r in reactions]
+        report = f"Designed {len(reactions)} reactions — " + ", ".join(parts)
 
     return DesignResponse(
         insert_length=len(seq),
         total_length=len(req.plasmid_upstream) + len(seq) + len(req.plasmid_downstream),
-        num_oligos=len(final_oligos),
-        num_overlaps=len(final_overlaps),
+        num_oligos=total_oligos,
+        num_overlaps=total_overlaps,
         avg_overlap_tm=round(avg_tm, 1) if avg_tm is not None else None,
-        oligos=final_oligos,
-        overlaps=final_overlaps,
-        gblocks=gblock_outs,
         sequence_issues=seq_issues,
         report_text=report,
+        reactions=reactions,
+    )
+
+
+def _tile_segment(
+    segment_dna: str,
+    seg_gbs: list[dict],
+    left_flank: str,
+    right_flank: str,
+    conditions: ReactionConditions,
+    req: DesignRequest,
+):
+    """Tile one reaction's segment with the supplied flanks.
+
+    Returns (oligos, overlaps, gblock_frags) in REACTION-LOCAL full_seq
+    coordinates (i.e. positions relative to `left_flank + segment_dna +
+    right_flank`). Callers translate these to the global construct frame.
+    """
+    if not seg_gbs:
+        oligos_, overlaps_ = tile_sequence(
+            segment_dna, max_oligo_length=req.max_oligo_length,
+            overlap_length=req.overlap_length,
+            plasmid_upstream=left_flank,
+            plasmid_downstream=right_flank,
+            conditions=conditions,
+        )
+        return oligos_, overlaps_, []
+    gb_tuples = [(g.get("start_bp", 0), g.get("end_bp", 0), g.get("label", ""))
+                 for g in seg_gbs]
+    oligos_, overlaps_, gblock_frags_ = tile_sequence_with_gblocks(
+        segment_dna,
+        gblock_regions=gb_tuples,
+        max_oligo_length=req.max_oligo_length,
+        overlap_length=req.overlap_length,
+        plasmid_upstream=left_flank,
+        plasmid_downstream=right_flank,
+        conditions=conditions,
+    )
+    return oligos_, overlaps_, gblock_frags_
+
+
+def _has_cross_hyb(overlaps) -> bool:
+    for o in overlaps:
+        for iss in o.issues:
+            if iss.kind == "cross_hybridization":
+                return True
+    return False
+
+
+def _run_cross_hyb_repair_segment(
+    *,
+    seg_dna: str,
+    seg_protein_start_aa: int,
+    seg_protein_end_aa: int,
+    overlaps,
+    conditions,
+    req: DesignRequest,
+    left_flank: str,
+    right_flank: str,
+    frozen_ranges: list[dict],
+) -> RepairReport:
+    """Run the cross-hyb repair pass on a single reaction segment.
+
+    This is a drop-in for what used to be the monolithic whole-insert repair.
+    The key differences:
+
+    - `seg_dna` is the segment's portion of the optimized insert DNA, and
+      the repair operates entirely in segment-local insert coordinates.
+    - `left_flank` / `right_flank` are the flanks used during tiling for
+      this segment — they may be plasmid sequence (for edge reactions) or
+      the junction DNA borrowed from the neighboring reaction.
+    - `frozen_ranges` is a list of insert-bp ranges (in segment-local
+      coords) that the repair pass must never modify. This covers both
+      gBlocks inside the segment AND the junction buffers at each end
+      (`overlap_length` bp on each junction-facing side). Freezing the
+      junctions guarantees the shared overlap DNA stays identical in both
+      reactions, so they still anneal correctly in the second Gibson.
+    """
+    from cross_hyb_repair import repair_cross_hybridization
+
+    ctx = req.repair_context
+    if not ctx or not ctx.protein or not ctx.codon_table:
+        return RepairReport(ran=False, skipped_reason="Missing protein or codon table in repair_context")
+
+    codon_freqs: dict[str, dict[str, float]] = {}
+    for entry in ctx.codon_table:
+        aa = (entry.get("amino_acid") or "").upper()
+        codon = (entry.get("codon") or "").upper()
+        per_k = float(entry.get("per_thousand") or 0.0)
+        if not aa or len(codon) != 3:
+            continue
+        codon_freqs.setdefault(aa, {})[codon] = per_k
+    if not codon_freqs:
+        return RepairReport(ran=False, skipped_reason="Missing protein or codon table in repair_context")
+
+    # Segment-local protein for the segment-local DNA.
+    full_protein = ctx.protein.upper().replace(" ", "").replace("\n", "").rstrip("*")
+    seg_protein = full_protein[seg_protein_start_aa:seg_protein_end_aa]
+
+    # Frozen ranges (gBlocks + junction buffers) in segment-local insert coords.
+    frozen_tuples: list[tuple[int, int]] = []
+    for r in frozen_ranges:
+        gs = int(r.get("start_bp", 0))
+        ge = int(r.get("end_bp", 0))
+        if ge > gs:
+            frozen_tuples.append((gs, ge))
+
+    try:
+        result = repair_cross_hybridization(
+            insert_dna=seg_dna,
+            protein=seg_protein,
+            codon_freqs=codon_freqs,
+            min_codon_frequency=ctx.min_codon_frequency,
+            overlaps=overlaps,
+            plasmid_upstream=left_flank,
+            plasmid_downstream=right_flank,
+            conditions=conditions,
+            gc_min=ctx.gc_min, gc_max=ctx.gc_max, gc_window=ctx.gc_window,
+            avoid_homopolymers_gc=ctx.avoid_homopolymers_gc,
+            avoid_homopolymers_at=ctx.avoid_homopolymers_at,
+            avoid_patterns=list(ctx.avoid_patterns),
+            gblock_ranges_insert=frozen_tuples,
+        )
+    except Exception as exc:
+        return RepairReport(ran=False, skipped_reason=f"Repair pass failed: {exc}")
+
+    log_out = [
+        RepairLogEntryOut(
+            iteration=e.iteration,
+            kind=e.kind,
+            codon_index=e.codon_index,
+            insert_position=e.insert_position,
+            amino_acid=e.amino_acid,
+            old_codon=e.old_codon,
+            new_codon=e.new_codon,
+            old_freq_per_k=e.old_freq_per_k,
+            new_freq_per_k=e.new_freq_per_k,
+            gc_before=e.gc_before,
+            gc_after=e.gc_after,
+            fixed_pairs=[list(p) for p in e.fixed_pairs],
+            remaining_pairs=[list(p) for p in e.remaining_pairs],
+            remaining_max_tm=e.remaining_max_tm,
+            threshold_tm=e.threshold_tm,
+            notes=e.notes,
+        )
+        for e in result.log
+    ]
+    return RepairReport(
+        ran=True,
+        threshold_tm=round(result.threshold_tm, 1) if result.threshold_tm is not None else None,
+        issues_before=result.issues_before,
+        issues_after=result.issues_after,
+        log=log_out,
+        modified_dna=result.new_insert_dna if result.new_insert_dna != seg_dna else None,
     )
 
 
@@ -285,6 +640,15 @@ class CodonOptRequest(BaseModel):
     beam_k: int = Field(250, ge=1, description="Beam search width per bucket. Higher = better quality, slower.")
     auto_detect_gblocks: bool = Field(True, description="If the whole-protein beam fails, iteratively mark difficult regions as gBlocks and retry. Otherwise error out.")
     gblock_regions: list[GBlockRegionInput] = Field(default_factory=list, description="Regions to be ordered as IDT gBlocks (relaxed synthesis constraints)")
+    # Plasmid flanking sequences — the DNA that will sit immediately 5' and 3'
+    # of the insert in the final construct. When supplied, the beam search
+    # extends GC/homopolymer/avoid-pattern checks across the flank/insert
+    # junctions and the post-hoc k-mer uniqueness check evaluates the
+    # entire construct (flank + insert + flank), so any k-mer shared
+    # between the insert and the flanks is caught at optimization time
+    # rather than showing up later as an oligo cross-hybridization.
+    plasmid_upstream: str = Field("", description="Plasmid sequence immediately upstream of the insert (vector 5' flank)")
+    plasmid_downstream: str = Field("", description="Plasmid sequence immediately downstream of the insert (vector 3' flank)")
 
 
 class CodonDetail(BaseModel):
@@ -308,6 +672,12 @@ class SequenceWarning(BaseModel):
 
 
 class GBlockSegmentInfo(BaseModel):
+    # Stable 0-based index assigned in start_bp ascending order. This is the
+    # SAME variable the oligo designer uses for gBlock fragments (see
+    # GBlockFragment.index in oligo_designer.py), so "G{index+1}" labels the
+    # same physical fragment across both panels without having to rely on
+    # two independent sorts agreeing.
+    index: int = 0
     start_aa: int
     end_aa: int
     start_bp: int
@@ -340,6 +710,10 @@ class CodonOptResponse(BaseModel):
     gblock_segments: list[GBlockSegmentInfo] = []
     suggested_gblocks: list[GBlockSegmentInfo] = []   # auto-detected when beam fails
     gblocks_auto_applied: bool = False                 # True if suggestions were used to produce this result
+    # Echoed back so the frontend can detect when the result became stale
+    # because the user edited the plasmid flank inputs after optimizing.
+    input_plasmid_upstream: str = ""
+    input_plasmid_downstream: str = ""
 
 
 def _find_repetitive_aa_regions(
@@ -404,6 +778,8 @@ def _auto_detect_gblocks(
     initial_radius: int = 5,
     min_aa: int | None = None,
     progress_callback=None,
+    flank_left: str = "",
+    flank_right: str = "",
 ) -> list[GBlockRegionInput]:
     """Iteratively grow gBlock regions around beam failure points until the
     per-segment beam succeeds.
@@ -469,9 +845,15 @@ def _auto_detect_gblocks(
         all_ok = True
         seg_reports = []
 
-        for kind, start, end in segs:
+        for seg_idx, (kind, start, end) in enumerate(segs):
             sub = protein[start:end + 1]
             sub_dna = reverse_translate(sub)
+            # Only the first segment sees the upstream plasmid flank and only
+            # the last segment sees the downstream plasmid flank — interior
+            # segments are sandwiched between two previously-optimized pieces
+            # of insert and don't touch the vector at all.
+            seg_flank_left = flank_left if seg_idx == 0 else ""
+            seg_flank_right = flank_right if seg_idx == len(segs) - 1 else ""
             if kind == "gblock":
                 kwargs = dict(
                     gc_min=GBLOCK_GC_MIN, gc_max=GBLOCK_GC_MAX,
@@ -480,6 +862,8 @@ def _auto_detect_gblocks(
                     avoid_patterns=avoid_patterns,
                     min_codon_frequency=min_codon_frequency,
                     beam_k=beam_k,
+                    flank_left=seg_flank_left,
+                    flank_right=seg_flank_right,
                 )
             else:
                 kwargs = dict(
@@ -488,6 +872,8 @@ def _auto_detect_gblocks(
                     avoid_patterns=avoid_patterns,
                     min_codon_frequency=min_codon_frequency,
                     beam_k=beam_k,
+                    flank_left=seg_flank_left,
+                    flank_right=seg_flank_right,
                 )
             refined, warnings, report = refine_gc_windows(sub_dna, raw_table, **kwargs)
             if report.get("source") != "beam":
@@ -696,12 +1082,16 @@ def _build_suggested_gblock_info(
                 cur = 0
         return best
 
+    # Sort by start_aa so the resulting `index` (G1, G2, ...) matches the
+    # order the oligo designer will re-emit these as GBlockFragments.
+    sorted_suggestions = sorted(suggestions, key=lambda g: g.start_aa)
     result = []
-    for gb in suggestions:
+    for idx, gb in enumerate(sorted_suggestions):
         bp_start = gb.start_aa * 3
         bp_end = (gb.end_aa + 1) * 3
         region_dna = opt_dna[bp_start:bp_end] if bp_end <= len(opt_dna) else ""
         result.append(GBlockSegmentInfo(
+            index=idx,
             start_aa=gb.start_aa, end_aa=gb.end_aa,
             start_bp=bp_start, end_bp=bp_end,
             label=gb.label,
@@ -731,6 +1121,20 @@ def _run_codon_optimize(req: CodonOptRequest, progress_callback=None) -> CodonOp
 
     if protein.endswith("*"):
         protein = protein[:-1]
+
+    # Normalize plasmid flank inputs — same rules as the oligo designer's
+    # DesignRequest: upper-case, strip whitespace, validate DNA chars.
+    def _clean_flank(raw: str, which: str) -> str:
+        s = (raw or "").upper().replace(" ", "").replace("\n", "").replace("\t", "")
+        extra = set(s) - set("ATCGN")
+        if extra:
+            raise HTTPException(
+                400, f"Non-DNA characters in plasmid_{which}: {sorted(extra)}"
+            )
+        return s
+
+    flank_left = _clean_flank(req.plasmid_upstream, "upstream")
+    flank_right = _clean_flank(req.plasmid_downstream, "downstream")
 
     # Resolve codon table (used for frequency lookup by the beam search)
     if req.custom_codon_table:
@@ -839,6 +1243,7 @@ def _run_codon_optimize(req: CodonOptRequest, progress_callback=None) -> CodonOp
             min_codon_frequency=req.min_codon_frequency,
             beam_k=req.beam_k,
             progress_callback=_beam_progress,
+            flank_left=flank_left, flank_right=flank_right,
         )
 
         # AUTO-DETECT: if beam failed, iteratively find minimal gBlock regions
@@ -859,6 +1264,7 @@ def _run_codon_optimize(req: CodonOptRequest, progress_callback=None) -> CodonOp
                 min_codon_frequency=req.min_codon_frequency,
                 beam_k=req.beam_k,
                 progress_callback=progress_callback,
+                flank_left=flank_left, flank_right=flank_right,
             )
 
             if auto_suggested:
@@ -895,9 +1301,14 @@ def _run_codon_optimize(req: CodonOptRequest, progress_callback=None) -> CodonOp
         seg_reports = []
         codon_offset = 0
 
-        for kind, start, end in segments:
+        for seg_idx, (kind, start, end) in enumerate(segments):
             sub_protein = protein[start:end + 1]
             sub_dna = reverse_translate(sub_protein)
+            # Only the first/last segments see the plasmid flanks — mirrors
+            # the same rule used in _auto_detect_gblocks so interior
+            # segments aren't spuriously told the flank sits next to them.
+            seg_flank_left = flank_left if seg_idx == 0 else ""
+            seg_flank_right = flank_right if seg_idx == len(segments) - 1 else ""
 
             if kind == "gblock":
                 kwargs = dict(
@@ -908,6 +1319,8 @@ def _run_codon_optimize(req: CodonOptRequest, progress_callback=None) -> CodonOp
                     min_codon_frequency=req.min_codon_frequency,
                     beam_k=req.beam_k,
                     progress_callback=_make_beam_progress(len(sub_protein), codon_offset, n_codons),
+                    flank_left=seg_flank_left,
+                    flank_right=seg_flank_right,
                 )
             else:
                 kwargs = dict(
@@ -918,6 +1331,8 @@ def _run_codon_optimize(req: CodonOptRequest, progress_callback=None) -> CodonOp
                     min_codon_frequency=req.min_codon_frequency,
                     beam_k=req.beam_k,
                     progress_callback=_make_beam_progress(len(sub_protein), codon_offset, n_codons),
+                    flank_left=seg_flank_left,
+                    flank_right=seg_flank_right,
                 )
 
             refined, warnings, report = refine_gc_windows(sub_dna, raw_table, **kwargs)
@@ -979,13 +1394,23 @@ def _run_codon_optimize(req: CodonOptRequest, progress_callback=None) -> CodonOp
                 amino_acid=aa, codon=codon, per_thousand=round(per_k, 1)
             ))
 
-    # Re-evaluate constraints against the (possibly refined) sequence
+    # Re-evaluate constraints against the (possibly refined) sequence.
+    # For k-mer uniqueness we evaluate against the FULL construct (flanks +
+    # insert) so any insert k-mer that clashes with a flank k-mer is caught
+    # here rather than slipping through to the oligo designer, where it
+    # would surface as a cross-hybridization between overlaps whose
+    # sequence coincidentally matches a flank. The structural constraints
+    # (GC/homopolymer/avoid) are still evaluated on the insert only —
+    # those are about what we're SYNTHESIZING, and the flank bases are
+    # fixed vector sequence not under our control.
     eval_problem = DnaOptimizationProblem(
         sequence=opt_dna,
         constraints=constraints,
     )
+    insert_offset = len(flank_left)
+    full_construct_for_kmer = flank_left + opt_dna + flank_right
     kmer_problem = DnaOptimizationProblem(
-        sequence=opt_dna,
+        sequence=full_construct_for_kmer,
         constraints=[UniquifyAllKmers(req.uniquify_kmers)],
     )
 
@@ -1023,7 +1448,37 @@ def _run_codon_optimize(req: CodonOptRequest, progress_callback=None) -> CodonOp
         opt_dna, gc_min=req.gc_min, gc_max=req.gc_max, gc_window=req.gc_window,
         homo_gc=req.avoid_homopolymers_gc, homo_at=req.avoid_homopolymers_at,
     )
-    opt_warnings.extend(_kmer_warnings(opt_dna, kmer_problem, req.uniquify_kmers))
+
+    # k-mer warnings are computed in FULL-CONSTRUCT coordinates (because the
+    # kmer_problem was built against the full construct to catch insert ↔
+    # flank clashes). Translate them back into INSERT coordinates so they
+    # line up with the codon track and the other warnings:
+    #   - drop any warning that's entirely inside a flank — those describe
+    #     repeats living purely in the vector and aren't actionable here
+    #   - keep warnings that touch the insert, clip their start/end to the
+    #     insert window, and rewrite the embedded position range in the
+    #     message so it matches the shifted coordinates
+    insert_len = len(opt_dna)
+    raw_kmer_warnings = _kmer_warnings(
+        full_construct_for_kmer, kmer_problem, req.uniquify_kmers,
+    )
+    for w in raw_kmer_warnings:
+        ws_full = w.get("start", 0)
+        we_full = w.get("end", 0)
+        # Entirely inside a flank → skip
+        if we_full <= insert_offset or ws_full >= insert_offset + insert_len:
+            continue
+        ws_ins = max(0, ws_full - insert_offset)
+        we_ins = min(insert_len, we_full - insert_offset)
+        # Rewrite position range inside the message to the clipped insert
+        # coordinates. This keeps the displayed message consistent with
+        # the "start"/"end" fields the UI renders elsewhere.
+        old = f"{ws_full}-{we_full}"
+        new = f"{ws_ins}-{we_ins}"
+        w["start"] = ws_ins
+        w["end"] = we_ins
+        w["message"] = w.get("message", "").replace(old, new, 1)
+        opt_warnings.append(w)
     opt_warnings.extend(freq_warnings)
 
     # Filter warnings inside gBlock regions: suppress homopolymer/gc_window
@@ -1099,12 +1554,16 @@ def _run_codon_optimize(req: CodonOptRequest, progress_callback=None) -> CodonOp
                 cur = 0
         return best
 
+    # Sort by start_aa so the emitted `index` lines up with the gBlock
+    # numbering the oligo designer will produce after tiling.
+    sorted_gblocks = sorted(gblocks, key=lambda g: g.start_aa)
     gb_segments = []
-    for gb in gblocks:
+    for idx, gb in enumerate(sorted_gblocks):
         bp_start = gb.start_aa * 3
         bp_end = (gb.end_aa + 1) * 3
         region_dna = opt_dna[bp_start:bp_end]
         gb_segments.append(GBlockSegmentInfo(
+            index=idx,
             start_aa=gb.start_aa, end_aa=gb.end_aa,
             start_bp=bp_start, end_bp=bp_end,
             label=gb.label,
@@ -1136,6 +1595,8 @@ def _run_codon_optimize(req: CodonOptRequest, progress_callback=None) -> CodonOp
         gblock_segments=gb_segments,
         suggested_gblocks=_build_suggested_gblock_info(auto_suggested, opt_dna),
         gblocks_auto_applied=gblocks_auto_applied,
+        input_plasmid_upstream=flank_left,
+        input_plasmid_downstream=flank_right,
     )
 
 
@@ -1204,6 +1665,11 @@ class CheckConstraintsRequest(BaseModel):
     uniquify_kmers: int = Field(10, ge=6, le=20)
     avoid_patterns: list[str] = Field(default_factory=list)
     min_codon_frequency: float = Field(10.0, ge=0.0, le=100.0)
+    # Same flanks the codon optimizer received — when supplied, the live
+    # k-mer uniqueness check evaluates against the full construct so user
+    # edits are assessed in the same context as the original optimization.
+    plasmid_upstream: str = Field("", description="Plasmid sequence 5' of the insert")
+    plasmid_downstream: str = Field("", description="Plasmid sequence 3' of the insert")
 
 
 class CheckConstraintsResponse(BaseModel):
@@ -1459,9 +1925,16 @@ def check_constraints(req: CheckConstraintsRequest):
                         "start": loc.start,
                         "end": loc.end,
                     })
-    # Run k-mer check separately for grouped warnings
+    # Run k-mer check separately for grouped warnings. Evaluate against the
+    # full construct (flanks + edited insert) so an edit that accidentally
+    # recreates a flank k-mer is flagged immediately, matching the behavior
+    # of the main /api/codon-optimize flow.
+    flank_left = (req.plasmid_upstream or "").upper().replace(" ", "").replace("\n", "")
+    flank_right = (req.plasmid_downstream or "").upper().replace(" ", "").replace("\n", "")
+    insert_offset = len(flank_left)
+    full_for_kmer = flank_left + dna + flank_right
     kmer_problem = DnaOptimizationProblem(
-        sequence=dna,
+        sequence=full_for_kmer,
         constraints=[UniquifyAllKmers(req.uniquify_kmers)],
     )
     for ev in kmer_problem.constraints_evaluations():
@@ -1479,8 +1952,25 @@ def check_constraints(req: CheckConstraintsRequest):
     for cw in constraint_warnings:
         if (cw["kind"], cw["start"], cw["end"]) not in existing:
             warnings.append(cw)
-    # Add grouped k-mer warnings
-    warnings.extend(_kmer_warnings(dna, kmer_problem, req.uniquify_kmers))
+    # Add grouped k-mer warnings, translated back to insert coordinates.
+    # See _run_codon_optimize for the mirror implementation of the same
+    # clip/shift logic; both paths must stay consistent or live-edit
+    # warnings will render at the wrong positions in the codon track.
+    raw_kmer = _kmer_warnings(full_for_kmer, kmer_problem, req.uniquify_kmers)
+    insert_len = len(dna)
+    for w in raw_kmer:
+        ws_full = w.get("start", 0)
+        we_full = w.get("end", 0)
+        if we_full <= insert_offset or ws_full >= insert_offset + insert_len:
+            continue
+        ws_ins = max(0, ws_full - insert_offset)
+        we_ins = min(insert_len, we_full - insert_offset)
+        old = f"{ws_full}-{we_full}"
+        new = f"{ws_ins}-{we_ins}"
+        w["start"] = ws_ins
+        w["end"] = we_ins
+        w["message"] = w.get("message", "").replace(old, new, 1)
+        warnings.append(w)
 
     return CheckConstraintsResponse(
         constraints_pass=problem.all_constraints_pass(),

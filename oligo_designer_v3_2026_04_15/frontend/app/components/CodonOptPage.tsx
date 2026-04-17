@@ -4,7 +4,8 @@ import { useState, useEffect, useCallback } from "react";
 import InfoTip from "./InfoTip";
 import CodonTableView from "./CodonTableView";
 import CodonTrackViewer from "./CodonTrackViewer";
-import GBlockRegionSelector, { type GBlockRegion } from "./GBlockRegionSelector";
+import GBlockRegionsReadOnly from "./GBlockRegionsReadOnly";
+import type { RepairContext } from "./types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -100,19 +101,44 @@ interface CodonOptResult {
     beam_k?: number;
     min_frequency_achieved?: number;
   };
-  gblock_segments?: { start_aa: number; end_aa: number; start_bp: number; end_bp: number; label: string; len_bp: number; valid_size: boolean; gc: number; max_g_run: number; max_c_run: number }[];
-  suggested_gblocks?: { start_aa: number; end_aa: number; start_bp: number; end_bp: number; label: string; len_bp: number; valid_size: boolean; gc: number; max_g_run: number; max_c_run: number }[];
+  gblock_segments?: { index: number; start_aa: number; end_aa: number; start_bp: number; end_bp: number; label: string; len_bp: number; valid_size: boolean; gc: number; max_g_run: number; max_c_run: number }[];
+  suggested_gblocks?: { index: number; start_aa: number; end_aa: number; start_bp: number; end_bp: number; label: string; len_bp: number; valid_size: boolean; gc: number; max_g_run: number; max_c_run: number }[];
   gblocks_auto_applied?: boolean;
+  // Echoed flanks — used to detect when the user edited flank inputs
+  // after producing `result` and the displayed output is now stale.
+  input_plasmid_upstream?: string;
+  input_plasmid_downstream?: string;
 }
+
+// Example plasmid flanks for the pcDNA3.1(+) MCS, between HindIII and XhoI
+// (the most common mammalian-expression insertion window). Moved here from
+// OligoDesignerPage because the flank inputs now live on this pane.
+const PCDNA3_UPSTREAM = "AAGCTTGGTACCGAGCTCGG";
+const PCDNA3_DOWNSTREAM = "CTCGAGTCTAGAGGGCCCGT";
 
 interface CodonOptPageProps {
   onDnaChanged?: (dna: string) => void;
   onGblocksChanged?: (gblocks: { start_bp: number; end_bp: number; label: string; len_bp: number }[]) => void;
+  onRepairContextChanged?: (ctx: RepairContext | null) => void;
   prefillDna?: string;
   onPrefillConsumed?: () => void;
+  plasmidUpstream: string;
+  plasmidDownstream: string;
+  setPlasmidUpstream: (s: string) => void;
+  setPlasmidDownstream: (s: string) => void;
 }
 
-export default function CodonOptPage({ onDnaChanged, onGblocksChanged, prefillDna, onPrefillConsumed }: CodonOptPageProps) {
+export default function CodonOptPage({
+  onDnaChanged,
+  onGblocksChanged,
+  onRepairContextChanged,
+  prefillDna,
+  onPrefillConsumed,
+  plasmidUpstream,
+  plasmidDownstream,
+  setPlasmidUpstream,
+  setPlasmidDownstream,
+}: CodonOptPageProps) {
   const [protein, setProtein] = useState("");
   const [species, setSpecies] = useState("h_sapiens_9606");
   const [customTable, setCustomTable] = useState("");
@@ -127,7 +153,6 @@ export default function CodonOptPage({ onDnaChanged, onGblocksChanged, prefillDn
   const [beamK, setBeamK] = useState(250);
   const [autoDetectGblocks, setAutoDetectGblocks] = useState(true);
   const [avoidPatterns, setAvoidPatterns] = useState("");
-  const [gblockRegions, setGblockRegions] = useState<GBlockRegion[]>([]);
   const [progress, setProgress] = useState<{ stage: string; current: number; total: number } | null>(null);
   const [tables, setTables] = useState<string[]>([]);
   const [customTables, setCustomTables] = useState<string[]>([]);
@@ -155,23 +180,76 @@ export default function CodonOptPage({ onDnaChanged, onGblocksChanged, prefillDn
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [prefillDna]);
 
-  // Live-update the oligo designer when gBlock regions change (e.g. dragged
-  // in the region selector).  The DNA sequence is unchanged — only which
-  // regions are "gBlock" vs "tiled" differs — so the right pane just needs
-  // to re-tile. Debounced so drag bursts don't fire N retiles.
+  // Drop stale state when any input that produced `result` has diverged:
+  //   - protein sequence (switched examples, pasted a new sequence)
+  //   - plasmid flanks (flanks participate in beam search + k-mer
+  //     uniqueness, so editing them invalidates the optimization just
+  //     as surely as editing the protein does)
+  //
+  // Without this, the previous run's `result` lingers and its auto-detected
+  // gBlocks (plus codon track / oligo designer state downstream) bleed into
+  // the next optimization.
+  //
+  // The protein normalization below MUST mirror what the backend applies
+  // to `protein_sequence` before returning it as `input_protein` (see
+  // api.py: uppercase, strip whitespace, drop trailing `*` stop codon).
+  // Flanks are normalized the same way the backend's _clean_flank does.
   useEffect(() => {
     if (!result) return;
-    const t = setTimeout(() => {
-      onGblocksChanged?.(gblockRegions.map((r) => ({
-        start_bp: r.startBp,
-        end_bp: r.endBp,
-        label: r.label,
-        len_bp: r.endBp - r.startBp,
-      })));
-    }, 150);
-    return () => clearTimeout(t);
+    const normalizedProtein = protein
+      .toUpperCase()
+      .replace(/\s+/g, "")
+      .replace(/\*$/, "");
+    const normalizedUp = plasmidUpstream.toUpperCase().replace(/\s+/g, "");
+    const normalizedDown = plasmidDownstream.toUpperCase().replace(/\s+/g, "");
+    if (
+      normalizedProtein === result.input_protein &&
+      normalizedUp === (result.input_plasmid_upstream ?? "") &&
+      normalizedDown === (result.input_plasmid_downstream ?? "")
+    ) {
+      return;
+    }
+    setResult(null);
+    setEditedDna(null);
+    setEditedCodons(null);
+    setEditedConstraints(null);
+    setCodonHistory([]);
+    onGblocksChanged?.([]);
+    onDnaChanged?.("");
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [gblockRegions, result]);
+  }, [protein, plasmidUpstream, plasmidDownstream, result]);
+
+  // Emit a RepairContext whenever the optimization result or any of the
+  // live constraint settings change.  The context tells the oligo designer's
+  // cross-hyb repair pass which synonyms are allowed and which structural
+  // constraints any proposed swap must still satisfy. Keeping this in a
+  // useEffect (rather than setting it once inside handleSubmit) means the
+  // repair pass always uses the constraints the user is currently looking
+  // at — so if they tighten gcMin after optimization and re-tile, the
+  // repair respects the new limit.
+  useEffect(() => {
+    if (!result) {
+      onRepairContextChanged?.(null);
+      return;
+    }
+    const patterns = avoidPatterns
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    onRepairContextChanged?.({
+      protein: result.input_protein,
+      codon_table: result.codon_table,
+      min_codon_frequency: minCodonFrequency,
+      gc_min: gcMin / 100,
+      gc_max: gcMax / 100,
+      gc_window: gcWindow,
+      avoid_homopolymers_gc: avoidHomopolymersGC,
+      avoid_homopolymers_at: avoidHomopolymersAT,
+      avoid_patterns: patterns,
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [result, minCodonFrequency, gcMin, gcMax, gcWindow,
+      avoidHomopolymersGC, avoidHomopolymersAT, avoidPatterns]);
 
   useEffect(() => {
     fetch(`${API_URL}/api/codon-tables`)
@@ -215,11 +293,8 @@ export default function CodonOptPage({ onDnaChanged, onGblocksChanged, prefillDn
         min_codon_frequency: minCodonFrequency,
         beam_k: beamK,
         auto_detect_gblocks: autoDetectGblocks,
-        gblock_regions: gblockRegions.map((r) => ({
-          start_aa: Math.floor(r.startBp / 3),
-          end_aa: Math.floor(r.endBp / 3) - 1,
-          label: r.label,
-        })),
+        plasmid_upstream: plasmidUpstream,
+        plasmid_downstream: plasmidDownstream,
       };
 
       if (useCustomTable && customTable.trim()) {
@@ -279,19 +354,10 @@ export default function CodonOptPage({ onDnaChanged, onGblocksChanged, prefillDn
       setCodonHistory([]);
       onDnaChanged?.(finalResult.optimized_dna);
 
-      // If gBlocks were auto-detected, populate the region selector so the
-      // user can see and adjust them before re-running.
-      // If gBlocks were auto-detected or user-specified, sync to the region
-      // selector and notify the oligo designer side.
+      // Forward any auto-detected gBlocks to the oligo designer as a
+      // read-only output (manual editing was removed — the beam search's
+      // own suggestions are now the sole source of truth).
       const gbSegs = finalResult.gblock_segments ?? finalResult.suggested_gblocks ?? [];
-      if (finalResult.gblocks_auto_applied && finalResult.suggested_gblocks?.length) {
-        setGblockRegions(finalResult.suggested_gblocks.map((g: { start_bp: number; end_bp: number; label: string }, i: number) => ({
-          id: "auto_" + i,
-          startBp: g.start_bp,
-          endBp: g.end_bp,
-          label: g.label || `gBlock ${i + 1}`,
-        })));
-      }
       if (gbSegs.length > 0) {
         onGblocksChanged?.(gbSegs.map((g: { start_bp: number; end_bp: number; label: string; len_bp: number }) => ({
           start_bp: g.start_bp,
@@ -359,6 +425,8 @@ export default function CodonOptPage({ onDnaChanged, onGblocksChanged, prefillDn
         uniquify_kmers: uniquifyKmers,
         avoid_patterns: patterns,
         min_codon_frequency: minCodonFrequency,
+        plasmid_upstream: plasmidUpstream,
+        plasmid_downstream: plasmidDownstream,
       }),
     })
       .then((r) => r.json())
@@ -493,6 +561,64 @@ export default function CodonOptPage({ onDnaChanged, onGblocksChanged, prefillDn
           )}
         </div>
 
+        <details className="text-sm">
+          <summary className="cursor-pointer text-[#5f6368] hover:text-[#202124]">
+            <span className="inline-flex items-center gap-1">
+              Plasmid flanking sequences (optional)
+              <InfoTip text="DNA sitting immediately 5' and 3' of the insert in the final construct (the vector around your cloning site). When supplied, codon optimization avoids k-mer clashes and junction-spanning homopolymers/patterns that only exist because of the flanks. These same flanks define the first/last Gibson overlaps on the oligo designer side." />
+            </span>
+          </summary>
+          <div className="flex items-center gap-3 text-xs mt-2">
+            <span className="text-[#5f6368]">Examples:</span>
+            <button
+              type="button"
+              onClick={() => {
+                setPlasmidUpstream(PCDNA3_UPSTREAM);
+                setPlasmidDownstream(PCDNA3_DOWNSTREAM);
+              }}
+              className="text-[#1a73e8] hover:text-[#1967d2] cursor-pointer"
+            >
+              pcDNA3.1 (HindIII / XhoI)
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setPlasmidUpstream("");
+                setPlasmidDownstream("");
+              }}
+              className="text-[#5f6368] hover:text-[#202124] cursor-pointer"
+            >
+              clear
+            </button>
+          </div>
+          <div className="grid grid-cols-2 gap-4 mt-2">
+            <div>
+              <label className="block text-sm font-medium mb-1 text-[#202124]">
+                Upstream flank (~20bp)
+              </label>
+              <input
+                type="text"
+                value={plasmidUpstream}
+                onChange={(e) => setPlasmidUpstream(e.target.value)}
+                placeholder="e.g. GCTAGCTAGCTAGCTAGCTA"
+                className="w-full bg-white border border-[#dadce0] p-2 font-mono text-sm text-[#202124] focus:border-[#1a73e8] focus:outline-none"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1 text-[#202124]">
+                Downstream flank (~20bp)
+              </label>
+              <input
+                type="text"
+                value={plasmidDownstream}
+                onChange={(e) => setPlasmidDownstream(e.target.value)}
+                placeholder="e.g. TTAAGCTTGCATGCCTGCAG"
+                className="w-full bg-white border border-[#dadce0] p-2 font-mono text-sm text-[#202124] focus:border-[#1a73e8] focus:outline-none"
+              />
+            </div>
+          </div>
+        </details>
+
         <details className="text-sm" open>
           <summary className="cursor-pointer text-[#5f6368] hover:text-[#202124]">
             Synthesis constraints
@@ -603,7 +729,7 @@ export default function CodonOptPage({ onDnaChanged, onGblocksChanged, prefillDn
                     />
                     <span className="text-[#5f6368] flex items-center gap-1">
                       Auto-detect gBlock regions on beam failure
-                      <InfoTip text="If the beam search fails to find a solution under the current constraints, automatically mark the problematic regions as gBlocks (with IDT's looser synthesis limits) and retry. Disable to get an explicit error instead, so you can adjust constraints or draw regions manually." />
+                      <InfoTip text="If the beam search fails to find a solution under the current constraints, automatically mark the problematic regions as gBlocks (with IDT's looser synthesis limits) and retry. Disable to get an explicit error instead, so you can adjust constraints manually." />
                     </span>
                   </label>
                 </td>
@@ -841,49 +967,16 @@ export default function CodonOptPage({ onDnaChanged, onGblocksChanged, prefillDn
           {/* Summary + optimization report */}
           <div className="bg-white p-4 border border-[#dadce0]">
             {(() => {
+              // Auto-detected gBlocks used to render as a big blue banner here;
+              // they now show up as a dedicated read-only panel below the codon
+              // track (see GBlockRegionsReadOnly) plus a "gBlocks used" row in
+              // the summary below. The yellow "no solution" banner, which is a
+              // real failure state, is the only banner that remains.
               const src = result.optimization_report?.source;
               const beamFailed = src === "beam_pruned_empty" || src === "beam_no_solution";
-              const autoApplied = result.gblocks_auto_applied;
-              const suggestions = result.suggested_gblocks ?? [];
               const floorViolations = (result.warnings ?? []).filter(
                 (w: { kind?: string }) => w.kind === "low_codon_frequency",
               ).length;
-
-              if (autoApplied && suggestions.length > 0) {
-                const totalBp = suggestions.reduce((s, g) => s + g.len_bp, 0);
-                const totalCost = (totalBp * 0.07).toFixed(2);
-                return (
-                  <div className="mb-4 p-3 border-l-4 border-[#4285f4] bg-[#e8f0fe] text-sm text-[#202124]">
-                    <div className="font-medium mb-1">
-                      gBlock regions auto-detected ({suggestions.length} region{suggestions.length > 1 ? "s" : ""})
-                    </div>
-                    <div className="mb-2">
-                      The beam search could not satisfy all constraints for the full sequence.{" "}
-                      {suggestions.length} gBlock region{suggestions.length > 1 ? "s were" : " was"}{" "}
-                      automatically identified and applied — these will be ordered as pre-synthesized
-                      IDT gBlock fragments (~${totalCost}) instead of being tiled into overlapping oligos.
-                    </div>
-                    <div className="space-y-1 font-mono text-xs">
-                      {suggestions.map((g, i) => (
-                        <div key={i} className="flex items-center gap-3">
-                          <span className="inline-block w-2 h-2 rounded-sm bg-[#4285f4]" />
-                          <span>{g.label || `gBlock ${i + 1}`}</span>
-                          <span className="text-[#5f6368]">
-                            aa {g.start_aa}–{g.end_aa} ({g.len_bp} bp, GC {(g.gc * 100).toFixed(0)}%, ~${(g.len_bp * 0.07).toFixed(2)})
-                          </span>
-                          {!g.valid_size && (
-                            <span className="text-[#ea4335]">below IDT minimum (125 bp)</span>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                    <div className="mt-2 text-xs text-[#5f6368]">
-                      You can adjust these regions in the gBlock Regions selector above and re-run.
-                    </div>
-                  </div>
-                );
-              }
-
               if (!beamFailed) return null;
               return (
                 <div className="mb-4 p-3 border-l-4 border-[#e37400] bg-[#fef7e0] text-sm text-[#202124]">
@@ -951,6 +1044,24 @@ export default function CodonOptPage({ onDnaChanged, onGblocksChanged, prefillDn
                     </span>
                   </td>
                 </tr>
+                <tr>
+                  <td className="py-0.5 pr-4 text-[#5f6368] whitespace-nowrap">gBlocks used</td>
+                  <td className="py-0.5">
+                    {(() => {
+                      const gbs = result.gblock_segments ?? result.suggested_gblocks ?? [];
+                      if (gbs.length === 0) return "No";
+                      const totalBp = gbs.reduce((s, g) => s + g.len_bp, 0);
+                      return (
+                        <>
+                          Yes
+                          <span className="text-[#80868b] ml-2">
+                            ({gbs.length} region{gbs.length === 1 ? "" : "s"}, {totalBp} bp, ~${(totalBp * 0.07).toFixed(2)})
+                          </span>
+                        </>
+                      );
+                    })()}
+                  </td>
+                </tr>
               </tbody>
             </table>
 
@@ -993,7 +1104,11 @@ export default function CodonOptPage({ onDnaChanged, onGblocksChanged, prefillDn
             )}
           </div>
 
-          {/* Interactive codon track */}
+          {/* Interactive codon track. gBlock highlights come directly from
+              the beam search's auto-detected segments (preferred) or its
+              advisory suggestions — there's no manual-editing layer anymore.
+              If the user needs to change them, they re-run optimization with
+              different constraints. */}
           <CodonTrackViewer
             codons={currentCodons}
             codonTable={result.codon_table}
@@ -1002,25 +1117,27 @@ export default function CodonOptPage({ onDnaChanged, onGblocksChanged, prefillDn
             onDnaChange={handleCodonDnaChange}
             onUndo={handleCodonUndo}
             canUndo={codonHistory.length > 0}
-            gblockSegments={(result.gblock_segments ?? result.suggested_gblocks ?? []).map(g => ({
-              start_bp: g.start_bp,
-              end_bp: g.end_bp,
-              label: g.label,
-              len_bp: g.len_bp,
-              valid_size: g.valid_size,
-            }))}
+            gblockSegments={
+              (result.gblock_segments ?? result.suggested_gblocks ?? []).map((g) => ({
+                start_bp: g.start_bp,
+                end_bp: g.end_bp,
+                label: g.label,
+                len_bp: g.len_bp,
+                valid_size: g.valid_size,
+              }))
+            }
           />
 
-          {/* gBlock region selector — below the codon track for adjustment */}
-          {(result.gblock_segments?.length || result.suggested_gblocks?.length || gblockRegions.length > 0) && (
+          {/* Read-only gBlock panel: visualization + per-region list with
+              cost/length/GC. Replaces the old editable GBlockRegionSelector. */}
+          {(result.gblock_segments?.length || result.suggested_gblocks?.length) ? (
             <div className="bg-white border border-[#dadce0] p-4">
-              <GBlockRegionSelector
+              <GBlockRegionsReadOnly
                 dnaLength={result.length_dna}
-                regions={gblockRegions}
-                onChange={setGblockRegions}
+                regions={result.gblock_segments ?? result.suggested_gblocks ?? []}
               />
             </div>
-          )}
+          ) : null}
 
           {/* Codon table used */}
           <details className="bg-white border border-[#dadce0]">

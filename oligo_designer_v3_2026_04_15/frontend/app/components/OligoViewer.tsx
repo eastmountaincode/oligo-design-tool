@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo } from "react";
-import type { OligoData, OverlapData, SequenceIssue, TrackLayout } from "./viewer/types";
+import { overlapLabel, type OligoData, type OverlapData, type SequenceIssue, type TrackLayout } from "./viewer/types";
 import { reconstructSequence, BASE_COLORS, complementBase } from "./viewer/sequence-utils";
 import ZoomControls from "./viewer/ZoomControls";
 import Ruler from "./viewer/Ruler";
@@ -39,6 +39,14 @@ interface Props {
   // Defaults to the entire construct being insert (no flanks) for back-compat.
   insertStart?: number;
   insertEnd?: number;
+  // Multi-reaction assembly: split positions in INSERT bp coordinates.
+  // When present, vertical dashed lines are drawn across all tracks at
+  // each split, with a draggable "handle" above the ruler that the user
+  // can drag to move the split. On drag-end, `onSplitsChanged` is called
+  // with the new list. Snap-to-codon and gBlock avoidance are handled by
+  // the parent (this component just emits the raw insert-bp position).
+  splits?: number[];
+  onSplitsChanged?: (newSplits: number[]) => void;
 }
 
 const MIN_PX_PER_BP = 0.3;
@@ -63,6 +71,8 @@ export default function OligoViewer({
   fullSequence,
   insertStart = 0,
   insertEnd,
+  splits = [],
+  onSplitsChanged,
 }: Props) {
   const effectiveInsertEnd = insertEnd ?? totalLength;
   const hasUpstreamFlank = insertStart > 0;
@@ -81,6 +91,10 @@ export default function OligoViewer({
   const [panStart, setPanStart] = useState({ x: 0, scrollLeft: 0 });
   const [showIssues, setShowIssues] = useState(true);
   const [showGC, setShowGC] = useState(true);
+  // Transient drag state for split handles — the viewer shows a ghost
+  // line tracking the cursor while the user drags, then on release we
+  // commit the new position up to the parent for snap + re-tile.
+  const [draggingSplit, setDraggingSplit] = useState<{ index: number; currentBp: number } | null>(null);
 
   // Clear other selections when one is made
   function selectOligo(oligo: OligoData | null) {
@@ -252,7 +266,7 @@ export default function OligoViewer({
       if (!isDuplicate) {
         overlapIssuesAsSequenceIssues.push({
           type: `overlap_${iss.kind}`,
-          message: `Overlap ${ovl.index}: ${iss.message}`,
+          message: `Overlap ${overlapLabel(ovl)}: ${iss.message}`,
           severity: iss.severity,
           start: issStart,
           end: issEnd,
@@ -299,6 +313,48 @@ export default function OligoViewer({
     OVERLAP_H: antisenseY + oligoH - senseY,
   };
   const svgHeight = currentY;
+
+  // ---- Split-handle drag ----
+  //
+  // When the user presses one of the split handles above the ruler we
+  // attach window-level mousemove/mouseup listeners (so the drag keeps
+  // tracking even if the cursor leaves the SVG), translate the cursor
+  // x-coordinate into an INSERT-bp position, and on release commit it to
+  // the parent via `onSplitsChanged`. We don't enforce codon alignment or
+  // gBlock avoidance here — that's the parent's job. The visible ghost
+  // line is the RAW cursor position during drag and snaps to the parent's
+  // authoritative value on mouseup.
+  useEffect(() => {
+    if (!draggingSplit) return;
+    const svg = scrollRef.current?.querySelector("svg");
+    if (!svg) return;
+
+    function bpFromClientX(clientX: number): number {
+      const rect = (svg as SVGSVGElement).getBoundingClientRect();
+      const localX = clientX - rect.left + (scrollRef.current?.scrollLeft ?? 0);
+      const globalBp = Math.max(0, Math.min(totalLength, localX / pxPerBp));
+      return globalBp - insertStart;
+    }
+
+    function handleMove(e: MouseEvent) {
+      if (!draggingSplit) return;
+      const newBp = bpFromClientX(e.clientX);
+      setDraggingSplit({ index: draggingSplit.index, currentBp: newBp });
+    }
+    function handleUp(e: MouseEvent) {
+      if (!draggingSplit) return;
+      const finalBp = bpFromClientX(e.clientX);
+      const newSplits = splits.map((s, i) => (i === draggingSplit.index ? finalBp : s));
+      setDraggingSplit(null);
+      onSplitsChanged?.(newSplits);
+    }
+    window.addEventListener("mousemove", handleMove);
+    window.addEventListener("mouseup", handleUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMove);
+      window.removeEventListener("mouseup", handleUp);
+    };
+  }, [draggingSplit, totalLength, pxPerBp, insertStart, splits, onSplitsChanged]);
 
   // Zoom centered on viewport middle
   const handleZoom = useCallback((newPx: number) => {
@@ -583,15 +639,19 @@ export default function OligoViewer({
               );
             })}
 
-            {/* Overlaps (behind oligos) */}
+            {/* Overlaps (behind oligos). Keys namespace-include rxnIndex
+                because per-reaction indices collide across reactions. */}
             {overlaps.map((ovl) => (
               <OverlapRegion
-                key={ovl.index}
+                key={`ovl-${ovl.rxnIndex ?? 0}-${ovl.index}`}
                 overlap={ovl}
                 bp2x={bp2x}
                 layout={layout}
                 showNumbers={showNumbers}
-                isSelected={selectedOverlap?.index === ovl.index}
+                isSelected={
+                  selectedOverlap?.index === ovl.index &&
+                  selectedOverlap?.rxnIndex === ovl.rxnIndex
+                }
                 onSelect={selectOverlap}
               />
             ))}
@@ -599,7 +659,7 @@ export default function OligoViewer({
             {/* Sense oligos */}
             {senseOligos.map((o) => (
               <OligoArrow
-                key={o.index}
+                key={`ol-${o.rxnIndex ?? 0}-${o.index}-s`}
                 oligo={o}
                 bp2x={bp2x}
                 pxPerBp={pxPerBp}
@@ -608,7 +668,10 @@ export default function OligoViewer({
                 fullSeq={fullSeq}
                 showBases={showBases}
                 showNumbers={showNumbers}
-                isSelected={selectedOligo?.index === o.index}
+                isSelected={
+                  selectedOligo?.index === o.index &&
+                  selectedOligo?.rxnIndex === o.rxnIndex
+                }
                 onSelect={selectOligo}
               />
             ))}
@@ -616,7 +679,7 @@ export default function OligoViewer({
             {/* Antisense oligos */}
             {antisenseOligos.map((o) => (
               <OligoArrow
-                key={o.index}
+                key={`ol-${o.rxnIndex ?? 0}-${o.index}-a`}
                 oligo={o}
                 bp2x={bp2x}
                 pxPerBp={pxPerBp}
@@ -625,7 +688,10 @@ export default function OligoViewer({
                 fullSeq={fullSeq}
                 showBases={showBases}
                 showNumbers={showNumbers}
-                isSelected={selectedOligo?.index === o.index}
+                isSelected={
+                  selectedOligo?.index === o.index &&
+                  selectedOligo?.rxnIndex === o.rxnIndex
+                }
                 onSelect={selectOligo}
               />
             ))}
@@ -689,6 +755,65 @@ export default function OligoViewer({
                 </g>
               );
             })()}
+
+            {/* Split markers (multi-reaction assembly). Drawn LAST so they
+                sit on top of all tracks. Each split gets a dashed vertical
+                line spanning the full SVG height plus a small handle just
+                above the ruler that the user can click & drag to move the
+                split position. While dragging, a blue ghost line follows
+                the cursor; on release we emit the new position to the
+                parent, which snaps to codon boundary + avoids gBlocks. */}
+            {splits.length > 0 && splits.map((splitBp, i) => {
+              const isDragging = draggingSplit?.index === i;
+              const effectiveBp = isDragging ? draggingSplit!.currentBp : splitBp;
+              const x = bp2x(insertStart + effectiveBp);
+              const handleSize = 10;
+              const SPLIT_COLOR = "#7c3aed";  // purple — distinct from blue/orange/teal/green
+              return (
+                <g key={`split-${i}`}>
+                  <line
+                    x1={x}
+                    y1={0}
+                    x2={x}
+                    y2={svgHeight}
+                    stroke={SPLIT_COLOR}
+                    strokeWidth={isDragging ? 1.5 : 1}
+                    strokeDasharray="5 3"
+                    style={{ pointerEvents: "none" }}
+                  />
+                  {/* Drag handle. Rendered as a filled diamond sitting just
+                      above the ruler so it's unambiguous what you're
+                      grabbing. Cursor is `col-resize` to hint at horizontal
+                      dragging. */}
+                  <g
+                    style={{ cursor: "col-resize" }}
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setDraggingSplit({ index: i, currentBp: splitBp });
+                    }}
+                  >
+                    <polygon
+                      points={`${x - handleSize},2 ${x + handleSize},2 ${x + handleSize / 2},${handleSize + 2} ${x - handleSize / 2},${handleSize + 2}`}
+                      fill={SPLIT_COLOR}
+                      stroke="#fff"
+                      strokeWidth={1}
+                    />
+                    <text
+                      x={x}
+                      y={handleSize + 14}
+                      textAnchor="middle"
+                      fontSize={9}
+                      fontWeight="bold"
+                      fill={SPLIT_COLOR}
+                      style={{ pointerEvents: "none" }}
+                    >
+                      R{i + 1}|R{i + 2}
+                    </text>
+                  </g>
+                </g>
+              );
+            })}
           </svg>
         </div>
 

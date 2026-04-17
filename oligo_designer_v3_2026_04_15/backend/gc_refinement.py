@@ -33,6 +33,8 @@ def refine_gc_windows(
     min_codon_frequency: float = 10.0,
     beam_k: int = 15,
     progress_callback=None,
+    flank_left: str = "",
+    flank_right: str = "",
 ) -> tuple[str, list[dict], dict]:
     """Refine codon choices globally to minimize total frequency loss.
 
@@ -42,6 +44,14 @@ def refine_gc_windows(
     - No A/T homopolymer runs >= homo_at
     - No matches for avoid_patterns
     - No codon with frequency < min_codon_frequency (when alternatives exist)
+
+    ``flank_left`` and ``flank_right`` optionally provide the DNA that will
+    sit immediately 5' and 3' of the insert in the final construct
+    (typically the plasmid vector flanks).  When supplied, the beam's
+    sliding-window / homopolymer / avoid-pattern checks see the full
+    local context across flank–insert junctions, so the optimizer can
+    avoid e.g. creating a homopolymer or restriction site that only
+    exists because of the adjacent flank bases.
 
     The beam is bucketed by (window GC count, last-codon GC count) and we
     keep the top ``beam_k`` paths per bucket by loss.  The bucket key is
@@ -54,6 +64,8 @@ def refine_gc_windows(
 
     Returns (refined_dna, freq_warnings, optimization_report).
     """
+    flank_left = (flank_left or "").upper()
+    flank_right = (flank_right or "").upper()
     n_codons = len(dna) // 3
     if n_codons == 0:
         return dna, [], {}
@@ -104,12 +116,20 @@ def refine_gc_windows(
             self.codon = codon
             self.parent = parent
 
-    root = Entry(0.0, "", None, None)
+    # Seed the root tail with the upstream flank so the first few sliding
+    # windows and boundary checks see the real upstream context rather than
+    # an empty string. This makes the beam avoid codons that only become a
+    # problem (homopolymer / pattern / out-of-range GC) when preceded by the
+    # flank. We keep at most `tail_len` bases — the beam only ever needs the
+    # trailing window of context.
+    seed_tail = flank_left[-tail_len:] if flank_left else ""
+    seed_wgc = _gc(seed_tail[-gc_window:]) if len(seed_tail) >= gc_window else _gc(seed_tail)
+    root = Entry(0.0, seed_tail, None, None)
     # Bucket key: (window_gc_count, last_codon_gc_count). The second dimension
     # diversifies paths whose GC totals match but whose tails differ — those
     # have different futures because the next sliding window will see different
     # bases falling out.
-    beam: dict[tuple[int, int], list[Entry]] = {(0, 0): [root]}
+    beam: dict[tuple[int, int], list[Entry]] = {(seed_wgc, 0): [root]}
 
     for ci in range(n_codons):
         if progress_callback is not None:
@@ -123,8 +143,12 @@ def refine_gc_windows(
                     new_loss = entry.loss + (best_scores[ci] - alt_score)
                     new_tail = (entry.tail + alt_codon)[-tail_len:]
 
-                    # GC window check: up to 3 newly complete windows
-                    if placed >= gc_window:
+                    # GC window check: up to 3 newly complete windows.
+                    # Gate on `len(new_tail)` (not just `placed`) so that
+                    # when an upstream flank seeds the tail, sliding-window
+                    # checks fire on the very first codon rather than
+                    # waiting until the insert alone fills a window.
+                    if len(new_tail) >= gc_window:
                         gc_ok = True
                         for offset in range(3):
                             w_end = len(new_tail) - offset
@@ -186,11 +210,70 @@ def refine_gc_windows(
             report["failed_at_codon"] = ci
             return dna, _freq_warnings(dna, n_codons, aa_seq, raw_table, alt_cache, min_codon_frequency, beam_failed=True), report
 
-    # Best solution across all buckets
+    # Downstream-flank boundary filter.
+    # Each candidate in the final beam has `entry.tail` containing the last
+    # `tail_len` bases of (optionally seeded flank_left + insert). Now that
+    # the insert is complete, we need to confirm that appending flank_right
+    # doesn't create a junction-spanning violation (homopolymer that only
+    # exists because the insert ends in CCCC and the flank starts with C,
+    # a restriction site that lands across the junction, a GC window that
+    # drifts out of range once the flank's bases come into view, etc).
+    # Entries that would fail are filtered out here rather than being
+    # flagged as warnings later, because the beam's purpose is prevention.
+    max_pat_len = max((len(getattr(p, "pattern", "")) for p in compiled_patterns), default=0)
+
+    def _boundary_ok(entry_tail: str) -> bool:
+        if not flank_right:
+            return True
+        # Check the last gc_window bases plus enough of flank_right to cover
+        # any junction-spanning sliding window, homopolymer run, or
+        # avoid-pattern match. Taking the max of all three ensures we never
+        # truncate the junction region below what a check actually needs.
+        needed = max(gc_window, max_homo + 2, max_pat_len)
+        junction = entry_tail + flank_right[:needed]
+        # GC window sweep over every junction-touching window — i.e. every
+        # window whose right edge is strictly past the end of entry_tail.
+        # Windows that lie entirely inside entry_tail were already enforced
+        # during the beam's per-codon step and don't need to be re-checked.
+        for w_end in range(len(entry_tail) + 1, len(junction) + 1):
+            w_start = w_end - gc_window
+            if w_start < 0:
+                continue
+            gc_frac = _gc(junction[w_start:w_end]) / gc_window
+            if gc_frac < gc_min or gc_frac > gc_max:
+                return False
+        # Homopolymer check at the junction tail.
+        region = junction[-(max_homo + 2 + len(flank_right)):]
+        for base in "GC":
+            if base * homo_gc in region:
+                return False
+        for base in "AT":
+            if base * homo_at in region:
+                return False
+        # Avoid patterns at the junction.
+        for pat in compiled_patterns:
+            if pat.search(region):
+                return False
+        return True
+
+    # Best solution across all buckets, preferring entries that survive the
+    # boundary filter. If no entry survives (e.g. the flank is inherently
+    # problematic given the constraints), we fall back to the unfiltered
+    # best so the caller still gets a result and the post-hoc warnings
+    # panel can surface the junction issue for the user.
     best: Entry | None = None
+    best_boundary_ok: Entry | None = None
     for entries in beam.values():
-        if entries and (best is None or entries[0].loss < best.loss):
-            best = entries[0]
+        for e in entries:
+            if best is None or e.loss < best.loss:
+                best = e
+        if flank_right:
+            for e in entries:
+                if _boundary_ok(e.tail) and (best_boundary_ok is None or e.loss < best_boundary_ok.loss):
+                    best_boundary_ok = e
+
+    if flank_right and best_boundary_ok is not None:
+        best = best_boundary_ok
 
     if best is None:
         return dna, _freq_warnings(dna, n_codons, aa_seq, raw_table, alt_cache, min_codon_frequency, beam_failed=True), _early_report(

@@ -1,4 +1,4 @@
-import type { OverlapData, TrackLayout } from "./types";
+import { overlapLabel, type OverlapData, type TrackLayout } from "./types";
 import { getOverlapColor } from "./colors";
 
 interface Props {
@@ -70,7 +70,7 @@ export default function OverlapRegion({
             fontWeight="bold"
             opacity={0.85}
           >
-            {overlap.index}
+            {overlapLabel(overlap)}
           </text>
           <text
             x={x + w / 2}

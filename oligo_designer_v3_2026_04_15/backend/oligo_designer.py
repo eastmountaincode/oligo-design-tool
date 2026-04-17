@@ -430,7 +430,13 @@ def tile_sequence(
             oligo_seq = reverse_complement(oligo_seq)
 
         oligo = Oligo(
-            index=i + 1,
+            # Oligo.index is 0-indexed everywhere else in the pipeline
+            # (tile_sequence_with_gblocks reindexes with `for i, o in
+            # enumerate(oligos): o.index = i`, and the frontend renders
+            # `o.index + 1` to get the 1-indexed display number). Using
+            # `i + 1` here made the first oligo display as "#2" in the
+            # Fragments table.
+            index=i,
             seq=oligo_seq,
             start=start,
             end=end,

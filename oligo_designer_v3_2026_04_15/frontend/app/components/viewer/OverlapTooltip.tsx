@@ -1,4 +1,4 @@
-import type { OverlapData } from "./types";
+import { overlapLabel, type OverlapData } from "./types";
 import { ISSUE_COLORS } from "./colors";
 
 interface Props {
@@ -10,7 +10,7 @@ export default function OverlapTooltip({ overlap, onClose }: Props) {
   return (
     <div className="mt-3 bg-white border border-[#dadce0] p-4">
       <div className="flex items-center justify-between mb-3">
-        <span className="font-medium text-[#202124]">Overlap {overlap.index}</span>
+        <span className="font-medium text-[#202124]">Overlap {overlapLabel(overlap)}</span>
         <button
           onClick={onClose}
           className="text-[#5f6368] hover:text-[#202124] text-sm cursor-pointer"

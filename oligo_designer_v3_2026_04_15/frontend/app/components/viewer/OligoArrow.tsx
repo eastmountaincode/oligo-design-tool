@@ -1,4 +1,4 @@
-import type { OligoData } from "./types";
+import { oligoLabel, type OligoData } from "./types";
 import { getOligoColor } from "./colors";
 import { BASE_COLORS, complementBase } from "./sequence-utils";
 
@@ -64,7 +64,7 @@ export default function OligoArrow({
               textAnchor="middle"
               style={{ pointerEvents: "none" }}
             >
-              {oligo.index + 1}
+              {oligoLabel(oligo)}
             </text>
           )}
     </g>
