@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback } from "react";
 import InfoTip from "./InfoTip";
 import CodonTableView from "./CodonTableView";
 import CodonTrackViewer from "./CodonTrackViewer";
+import GBlockRegionSelector, { type GBlockRegion } from "./GBlockRegionSelector";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -99,15 +100,19 @@ interface CodonOptResult {
     beam_k?: number;
     min_frequency_achieved?: number;
   };
+  gblock_segments?: { start_aa: number; end_aa: number; start_bp: number; end_bp: number; label: string; len_bp: number; valid_size: boolean; gc: number; max_g_run: number; max_c_run: number }[];
+  suggested_gblocks?: { start_aa: number; end_aa: number; start_bp: number; end_bp: number; label: string; len_bp: number; valid_size: boolean; gc: number; max_g_run: number; max_c_run: number }[];
+  gblocks_auto_applied?: boolean;
 }
 
 interface CodonOptPageProps {
   onDnaChanged?: (dna: string) => void;
+  onGblocksChanged?: (gblocks: { start_bp: number; end_bp: number; label: string; len_bp: number }[]) => void;
   prefillDna?: string;
   onPrefillConsumed?: () => void;
 }
 
-export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsumed }: CodonOptPageProps) {
+export default function CodonOptPage({ onDnaChanged, onGblocksChanged, prefillDna, onPrefillConsumed }: CodonOptPageProps) {
   const [protein, setProtein] = useState("");
   const [species, setSpecies] = useState("h_sapiens_9606");
   const [customTable, setCustomTable] = useState("");
@@ -121,6 +126,7 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
   const [minCodonFrequency, setMinCodonFrequency] = useState(10);
   const [beamK, setBeamK] = useState(250);
   const [avoidPatterns, setAvoidPatterns] = useState("");
+  const [gblockRegions, setGblockRegions] = useState<GBlockRegion[]>([]);
   const [progress, setProgress] = useState<{ stage: string; current: number; total: number } | null>(null);
   const [tables, setTables] = useState<string[]>([]);
   const [customTables, setCustomTables] = useState<string[]>([]);
@@ -147,6 +153,24 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [prefillDna]);
+
+  // Live-update the oligo designer when gBlock regions change (e.g. dragged
+  // in the region selector).  The DNA sequence is unchanged — only which
+  // regions are "gBlock" vs "tiled" differs — so the right pane just needs
+  // to re-tile. Debounced so drag bursts don't fire N retiles.
+  useEffect(() => {
+    if (!result) return;
+    const t = setTimeout(() => {
+      onGblocksChanged?.(gblockRegions.map((r) => ({
+        start_bp: r.startBp,
+        end_bp: r.endBp,
+        label: r.label,
+        len_bp: r.endBp - r.startBp,
+      })));
+    }, 150);
+    return () => clearTimeout(t);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gblockRegions, result]);
 
   useEffect(() => {
     fetch(`${API_URL}/api/codon-tables`)
@@ -189,6 +213,11 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
         avoid_patterns: patterns,
         min_codon_frequency: minCodonFrequency,
         beam_k: beamK,
+        gblock_regions: gblockRegions.map((r) => ({
+          start_aa: Math.floor(r.startBp / 3),
+          end_aa: Math.floor(r.endBp / 3) - 1,
+          label: r.label,
+        })),
       };
 
       if (useCustomTable && customTable.trim()) {
@@ -247,6 +276,30 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
       setResult(finalResult);
       setCodonHistory([]);
       onDnaChanged?.(finalResult.optimized_dna);
+
+      // If gBlocks were auto-detected, populate the region selector so the
+      // user can see and adjust them before re-running.
+      // If gBlocks were auto-detected or user-specified, sync to the region
+      // selector and notify the oligo designer side.
+      const gbSegs = finalResult.gblock_segments ?? finalResult.suggested_gblocks ?? [];
+      if (finalResult.gblocks_auto_applied && finalResult.suggested_gblocks?.length) {
+        setGblockRegions(finalResult.suggested_gblocks.map((g: { start_bp: number; end_bp: number; label: string }, i: number) => ({
+          id: "auto_" + i,
+          startBp: g.start_bp,
+          endBp: g.end_bp,
+          label: g.label || `gBlock ${i + 1}`,
+        })));
+      }
+      if (gbSegs.length > 0) {
+        onGblocksChanged?.(gbSegs.map((g: { start_bp: number; end_bp: number; label: string; len_bp: number }) => ({
+          start_bp: g.start_bp,
+          end_bp: g.end_bp,
+          label: g.label,
+          len_bp: g.len_bp,
+        })));
+      } else {
+        onGblocksChanged?.([]);
+      }
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Unknown error");
     } finally {
@@ -553,15 +606,33 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
           <div className="mt-3">
             <div className="flex items-center justify-between mb-1 text-xs text-[#5f6368]">
               <span>
-                Beam search
-                {progress && progress.total > 0 && ` — codon ${progress.current} of ${progress.total}`}
+                {(() => {
+                  if (!progress) return "Optimizing…";
+                  if (progress.stage === "gblock_detect")
+                    return `Auto-detecting gBlock regions — iteration ${progress.current + 1} of ${progress.total}`;
+                  if (progress.stage === "gblock_shrink")
+                    return `Shrinking gBlock regions — ${progress.current + 1} of ${progress.total}`;
+                  return `Beam search — codon ${progress.current} of ${progress.total}`;
+                })()}
               </span>
-              <span>{progress && progress.total > 0 ? `${Math.round((progress.current / progress.total) * 100)}%` : ""}</span>
+              <span>
+                {progress && progress.total > 0
+                  ? `${Math.round((progress.current / progress.total) * 100)}%`
+                  : ""}
+              </span>
             </div>
             <div className="w-full h-1.5 bg-[#e8eaed] overflow-hidden">
               <div
-                className="h-full bg-[#1a73e8] transition-all"
-                style={{ width: progress && progress.total > 0 ? `${(progress.current / progress.total) * 100}%` : "0%" }}
+                className={`h-full transition-all ${
+                  progress?.stage === "gblock_detect" || progress?.stage === "gblock_shrink"
+                    ? "bg-[#00897b]"
+                    : "bg-[#1a73e8]"
+                }`}
+                style={{
+                  width: progress && progress.total > 0
+                    ? `${(progress.current / progress.total) * 100}%`
+                    : "0%",
+                }}
               />
             </div>
           </div>
@@ -754,9 +825,47 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
             {(() => {
               const src = result.optimization_report?.source;
               const beamFailed = src === "beam_pruned_empty" || src === "beam_no_solution";
+              const autoApplied = result.gblocks_auto_applied;
+              const suggestions = result.suggested_gblocks ?? [];
               const floorViolations = (result.warnings ?? []).filter(
                 (w: { kind?: string }) => w.kind === "low_codon_frequency",
               ).length;
+
+              if (autoApplied && suggestions.length > 0) {
+                const totalBp = suggestions.reduce((s, g) => s + g.len_bp, 0);
+                const totalCost = (totalBp * 0.07).toFixed(2);
+                return (
+                  <div className="mb-4 p-3 border-l-4 border-[#4285f4] bg-[#e8f0fe] text-sm text-[#202124]">
+                    <div className="font-medium mb-1">
+                      gBlock regions auto-detected ({suggestions.length} region{suggestions.length > 1 ? "s" : ""})
+                    </div>
+                    <div className="mb-2">
+                      The beam search could not satisfy all constraints for the full sequence.{" "}
+                      {suggestions.length} gBlock region{suggestions.length > 1 ? "s were" : " was"}{" "}
+                      automatically identified and applied — these will be ordered as pre-synthesized
+                      IDT gBlock fragments (~${totalCost}) instead of being tiled into overlapping oligos.
+                    </div>
+                    <div className="space-y-1 font-mono text-xs">
+                      {suggestions.map((g, i) => (
+                        <div key={i} className="flex items-center gap-3">
+                          <span className="inline-block w-2 h-2 rounded-sm bg-[#4285f4]" />
+                          <span>{g.label || `gBlock ${i + 1}`}</span>
+                          <span className="text-[#5f6368]">
+                            aa {g.start_aa}–{g.end_aa} ({g.len_bp} bp, GC {(g.gc * 100).toFixed(0)}%, ~${(g.len_bp * 0.07).toFixed(2)})
+                          </span>
+                          {!g.valid_size && (
+                            <span className="text-[#ea4335]">below IDT minimum (125 bp)</span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                    <div className="mt-2 text-xs text-[#5f6368]">
+                      You can adjust these regions in the gBlock Regions selector above and re-run.
+                    </div>
+                  </div>
+                );
+              }
+
               if (!beamFailed) return null;
               return (
                 <div className="mb-4 p-3 border-l-4 border-[#e37400] bg-[#fef7e0] text-sm text-[#202124]">
@@ -875,7 +984,25 @@ export default function CodonOptPage({ onDnaChanged, prefillDna, onPrefillConsum
             onDnaChange={handleCodonDnaChange}
             onUndo={handleCodonUndo}
             canUndo={codonHistory.length > 0}
+            gblockSegments={(result.gblock_segments ?? result.suggested_gblocks ?? []).map(g => ({
+              start_bp: g.start_bp,
+              end_bp: g.end_bp,
+              label: g.label,
+              len_bp: g.len_bp,
+              valid_size: g.valid_size,
+            }))}
           />
+
+          {/* gBlock region selector — below the codon track for adjustment */}
+          {(result.gblock_segments?.length || result.suggested_gblocks?.length || gblockRegions.length > 0) && (
+            <div className="bg-white border border-[#dadce0] p-4">
+              <GBlockRegionSelector
+                dnaLength={result.length_dna}
+                regions={gblockRegions}
+                onChange={setGblockRegions}
+              />
+            </div>
+          )}
 
           {/* Codon table used */}
           <details className="bg-white border border-[#dadce0]">
